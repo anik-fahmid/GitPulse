@@ -1,0 +1,7 @@
+# Build artifacts
+GitPulse
+GitPulse.app/
+dmg-stage/
+*.iconset/
+icon_1024.png
+.DS_Store
