@@ -372,6 +372,8 @@ struct LoginView: View {
                 Link("Create a token (scopes: notifications, repo)",
                      destination: URL(string: "https://github.com/settings/tokens/new?scopes=notifications,repo&description=GitPulse")!).font(.caption2)
             }
+            Button { NSApp.terminate(nil) } label: { Label("Quit", systemImage: "power") }
+                .keyboardShortcut("q").font(.caption)
         }
         .padding(40).frame(minWidth: 470, minHeight: 540)
     }
@@ -531,8 +533,10 @@ struct PanelView: View {
             HStack(spacing: 8) {
                 Button { model.refresh(triggerNotify: false) } label: { Label("Fetch", systemImage: "arrow.clockwise") }
                 Button("Mark all read") { confirmAll = true }
-                Spacer()
                 if model.loading { ProgressView().controlSize(.small) }
+                Spacer()
+                Button { NSApp.terminate(nil) } label: { Label("Quit", systemImage: "power") }
+                    .help("Quit GitPulse").keyboardShortcut("q")
             }.font(.callout)
 
             if model.rows.isEmpty {
