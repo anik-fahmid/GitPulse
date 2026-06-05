@@ -497,8 +497,13 @@ struct SettingsView: View {
 // MARK: - Panel (the whole app, in a menu-bar window)
 struct PanelView: View {
     @EnvironmentObject var model: AppModel
-    @State private var showSettings = false
+    @Environment(\.openWindow) private var openWindow
     @State private var confirmAll = false
+
+    func openSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: "settings")
+    }
 
     var body: some View {
         Group {
@@ -519,7 +524,7 @@ struct PanelView: View {
                     .padding(.horizontal, 8).padding(.vertical, 2)
                     .background(model.unreadCount > 0 ? Color.red.opacity(0.18) : Color.gray.opacity(0.15))
                     .clipShape(Capsule())
-                Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                Button { openSettings() } label: { Image(systemName: "gearshape") }
                     .buttonStyle(.borderless).help("Settings")
             }
 
@@ -547,7 +552,6 @@ struct PanelView: View {
             Text(model.status).font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(12).frame(width: 440)
-        .sheet(isPresented: $showSettings) { SettingsView().environmentObject(model) }
         .confirmationDialog("Mark ALL notifications as read?", isPresented: $confirmAll, titleVisibility: .visible) {
             Button("Mark all read", role: .destructive) { model.markAllRead() }
             Button("Cancel", role: .cancel) {}
@@ -616,5 +620,11 @@ struct GitPulseApp: App {
             }
         }
         .menuBarExtraStyle(.window)
+
+        Window("GitPulse Settings", id: "settings") {
+            SettingsView().environmentObject(model)
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
     }
 }
