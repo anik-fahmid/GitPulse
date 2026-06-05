@@ -43,6 +43,7 @@ struct GitHub {
         r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         r.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         r.setValue("GitPulse", forHTTPHeaderField: "User-Agent")
+        if body != nil { r.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         r.httpBody = body
         URLSession.shared.dataTask(with: r) { d, resp, _ in
             completion(d, (resp as? HTTPURLResponse)?.statusCode ?? -1)
@@ -295,37 +296,36 @@ final class AppModel: ObservableObject {
     }
     func markAllRead() {
         guard let token = token else { return }
-        let a = NSAlert(); a.messageText = "Mark all notifications as read?"
-        a.informativeText = "Marks ALL your GitHub notifications as read."
-        a.addButton(withTitle: "Mark all read"); a.addButton(withTitle: "Cancel")
-        guard a.runModal() == .alertFirstButtonReturn else { return }
         let body = try? JSONSerialization.data(withJSONObject: ["read": true])
-        GitHub.req("https://api.github.com/notifications", method: "PUT", token: token, body: body) { _, _ in
-            DispatchQueue.main.async { self.status = "All marked read"; self.refresh(triggerNotify: false) }
+        GitHub.req("https://api.github.com/notifications", method: "PUT", token: token, body: body) { _, code in
+            DispatchQueue.main.async {
+                if code == 205 || code == 202 || code == 200 {
+                    self.rows = []; self.unreadCount = 0; self.updateBadge()
+                    self.seen.removeAll(); self.seeded = false
+                    self.status = "All marked read"
+                } else { self.status = "Mark all read failed (\(code))" }
+                self.refresh(triggerNotify: false)
+            }
+        }
+    }
+
+    // Mark a single notification thread as read.
+    func markThreadRead(_ id: Notif.ID) {
+        guard let token = token else { return }
+        GitHub.req("https://api.github.com/notifications/threads/\(id)", method: "PATCH", token: token) { _, code in
+            DispatchQueue.main.async {
+                if (200...205).contains(code) {
+                    self.rows.removeAll { $0.id == id }
+                    self.seen.insert(id)
+                    self.unreadCount = self.rows.filter { $0.unread }.count
+                    self.updateBadge()
+                    self.status = "Marked read"
+                } else { self.status = "Mark read failed (\(code))" }
+            }
         }
     }
 }
 
-// MARK: - App delegate (notification handling)
-final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
-    func applicationDidFinishLaunching(_ n: Notification) {
-        UNUserNotificationCenter.current().delegate = self
-        AppModel.shared.requestNotifAuth()
-        AppModel.shared.bootstrap()
-    }
-    func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { false }
-    func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
-                                withCompletionHandler h: @escaping (UNNotificationPresentationOptions) -> Void) {
-        h([.banner, .sound])
-    }
-    func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
-                                withCompletionHandler h: @escaping () -> Void) {
-        if let s = r.notification.request.content.userInfo["url"] as? String, let u = URL(string: s) {
-            NSWorkspace.shared.open(u)
-        }
-        h()
-    }
-}
 
 // MARK: - Login view
 struct LoginView: View {
@@ -410,188 +410,211 @@ func brandMark(size: CGFloat, corner: CGFloat) -> some View {
         .clipShape(RoundedRectangle(cornerRadius: corner))
 }
 
-// MARK: - Main view
-struct ContentView: View {
-    @EnvironmentObject var model: AppModel
-    @State private var selection: Notif.ID?
-    @State private var repoExpanded = false
-    @State private var repoSearch = ""
-    let cols = [GridItem(.adaptive(minimum: 200), spacing: 8)]
 
+// MARK: - Settings modal
+struct SettingsView: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var repoSearch = ""
+    let cols = [GridItem(.adaptive(minimum: 180), spacing: 8)]
     var filteredRepos: [String] {
         repoSearch.isEmpty ? model.allRepos
             : model.allRepos.filter { $0.localizedCaseInsensitiveContains(repoSearch) }
     }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                brandMark(size: 26, corner: 12)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("GitPulse").font(.system(size: 22, weight: .bold))
-                    Text(model.login.isEmpty ? "Review your GitHub notifications" : "Signed in as @\(model.login)")
-                        .font(.subheadline).foregroundStyle(.secondary)
-                }
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Settings").font(.title3.bold())
                 Spacer()
-                Text("\(model.unreadCount) unread").font(.headline)
-                    .padding(.horizontal, 10).padding(.vertical, 4)
-                    .background(model.unreadCount > 0 ? Color.red.opacity(0.15) : Color.gray.opacity(0.12))
-                    .clipShape(Capsule())
-                Button("Sign out") { model.signOut() }
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
 
-            DisclosureGroup(isExpanded: $repoExpanded) {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        TextField("Search repositories…", text: $repoSearch).textFieldStyle(.roundedBorder)
-                        Button(model.loadingRepos ? "Loading…" : "Load repos") { model.fetchRepos() }
-                            .disabled(model.loadingRepos)
-                    }
-                    if !model.allRepos.isEmpty {
-                        HStack(spacing: 10) {
-                            Button("Select all shown") { for r in filteredRepos { model.selectedRepos.insert(r) } }
-                            Button("Clear") { model.selectedRepos.removeAll() }
-                            Spacer()
-                            Text("\(model.selectedRepos.count) selected · \(filteredRepos.count) shown")
-                                .foregroundStyle(.secondary)
-                        }.font(.caption)
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 1) {
-                                ForEach(filteredRepos, id: \.self) { repo in
-                                    Toggle(isOn: Binding(
-                                        get: { model.selectedRepos.contains(repo) },
-                                        set: { on in if on { model.selectedRepos.insert(repo) } else { model.selectedRepos.remove(repo) } }
-                                    )) { Text(repo).font(.callout) }
-                                    .toggleStyle(.checkbox)
-                                }
-                            }.padding(6)
-                        }
-                        .frame(height: 150)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.textBackgroundColor)))
-                    } else {
-                        Text("Click “Load repos” to list every repository you can access, then check the ones to watch.")
-                            .font(.caption).foregroundStyle(.tertiary)
-                    }
-                }.padding(.top, 4)
-            } label: {
+            // Alerts
+            Toggle("Enable notifications", isOn: $model.notify).toggleStyle(.switch)
+            HStack {
+                Text("Reminder").foregroundStyle(.secondary)
+                Picker("", selection: $model.intervalSeconds) {
+                    ForEach(INTERVALS, id: \.seconds) { Text($0.label).tag($0.seconds) }
+                }.labelsHidden().frame(width: 190).disabled(!model.notify)
+                Button("Test") { model.testNotification() }
+            }.font(.callout)
+            Toggle("Unread only", isOn: $model.unreadOnly).toggleStyle(.checkbox)
+
+            Divider()
+            Text("Notification types (drives badge + alerts)").font(.caption).foregroundStyle(.secondary)
+            LazyVGrid(columns: cols, alignment: .leading, spacing: 4) {
+                ForEach(REASONS, id: \.value) { r in
+                    Toggle(isOn: Binding(
+                        get: { model.reasons.contains(r.value) },
+                        set: { on in if on { model.reasons.insert(r.value) } else { model.reasons.remove(r.value) } }
+                    )) { Text(r.label).font(.callout) }.toggleStyle(.checkbox)
+                }
+            }
+
+            Divider()
+            HStack {
                 Text("Repositories — \(model.selectedRepos.isEmpty ? "all" : "\(model.selectedRepos.count) selected")")
                     .font(.caption).foregroundStyle(.secondary)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Notification types (drives badge + alerts)").font(.caption).foregroundStyle(.secondary)
-                LazyVGrid(columns: cols, alignment: .leading, spacing: 6) {
-                    ForEach(REASONS, id: \.value) { r in
-                        Toggle(isOn: Binding(get: { model.reasons.contains(r.value) },
-                                             set: { on in if on { model.reasons.insert(r.value) } else { model.reasons.remove(r.value) } })) {
-                            Text(r.label)
-                        }.toggleStyle(.checkbox)
-                    }
-                }
-            }
-
-            // Alerts row
-            HStack(spacing: 14) {
-                Toggle("Enable notifications", isOn: $model.notify).toggleStyle(.switch)
-                Picker("Reminder", selection: $model.intervalSeconds) {
-                    ForEach(INTERVALS, id: \.seconds) { Text($0.label).tag($0.seconds) }
-                }.frame(width: 220).disabled(!model.notify)
-                Button("Test notification") { model.testNotification() }
                 Spacer()
+                Button(model.loadingRepos ? "Loading…" : "Load repos") { model.fetchRepos() }.disabled(model.loadingRepos)
             }
-
-            HStack {
-                Toggle("Unread only", isOn: $model.unreadOnly).toggleStyle(.checkbox)
-                Button(action: { model.refresh(triggerNotify: false) }) { Label("Fetch", systemImage: "arrow.clockwise") }
-                    .keyboardShortcut("r").disabled(model.loading)
-                Button("Mark all read") { model.markAllRead() }
-                if model.loading { ProgressView().controlSize(.small) }
-                Spacer()
-                Text(model.status).font(.caption).foregroundStyle(.secondary)
-            }
-
-            // Results (List with Cmd+click + double-click to open)
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    HStack(spacing: 8) {
-                        Text("Repository").frame(width: 200, alignment: .leading)
-                        Text("Type").frame(width: 60, alignment: .leading)
-                        Text("Reason").frame(width: 130, alignment: .leading)
-                        Text("Title").frame(maxWidth: .infinity, alignment: .leading)
-                    }.font(.caption.bold()).foregroundStyle(.secondary).padding(.horizontal, 8).padding(.vertical, 4)
-                    Divider()
-                    ForEach(model.rows) { r in
-                        HStack(spacing: 8) {
-                            Text(r.repo).frame(width: 200, alignment: .leading).lineLimit(1)
-                            Text(r.type).frame(width: 60, alignment: .leading).foregroundStyle(.secondary)
-                            Text(r.reason).frame(width: 130, alignment: .leading).foregroundStyle(.secondary)
-                            Text(r.title).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
-                            if r.unread { Circle().fill(Color.accentColor).frame(width: 7, height: 7) }
+            TextField("Search repositories…", text: $repoSearch).textFieldStyle(.roundedBorder)
+            if !model.allRepos.isEmpty {
+                HStack(spacing: 10) {
+                    Button("Select all shown") { for r in filteredRepos { model.selectedRepos.insert(r) } }
+                    Button("Clear") { model.selectedRepos.removeAll() }
+                    Spacer()
+                    Text("\(filteredRepos.count) shown").foregroundStyle(.secondary)
+                }.font(.caption)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 1) {
+                        ForEach(filteredRepos, id: \.self) { repo in
+                            Toggle(isOn: Binding(
+                                get: { model.selectedRepos.contains(repo) },
+                                set: { on in if on { model.selectedRepos.insert(repo) } else { model.selectedRepos.remove(repo) } }
+                            )) { Text(repo).font(.callout) }.toggleStyle(.checkbox)
                         }
-                        .padding(.horizontal, 8).padding(.vertical, 6)
-                        .background(selection == r.id ? Color.accentColor.opacity(0.15) : Color.clear)
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) { model.open(r.id) }
-                        .onTapGesture { selection = r.id }
-                        .simultaneousGesture(TapGesture().modifiers(.command).onEnded { model.open(r.id) })
-                        .contextMenu { Button("Open on GitHub") { model.open(r.id) } }
-                        Divider()
+                    }.padding(6)
+                }
+                .frame(height: 150)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.textBackgroundColor)))
+            } else {
+                Text("Click “Load repos” to list every repository you can access, then check the ones to watch.")
+                    .font(.caption).foregroundStyle(.tertiary)
+            }
+
+            Divider()
+            HStack {
+                Button(role: .destructive) { model.signOut(); dismiss() } label: { Text("Sign out") }
+                Spacer()
+                Text(model.login.isEmpty ? "" : "@\(model.login)").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(16).frame(width: 470, height: 640)
+    }
+}
+
+// MARK: - Panel (the whole app, in a menu-bar window)
+struct PanelView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var showSettings = false
+    @State private var confirmAll = false
+
+    var body: some View {
+        Group {
+            if model.token == nil { LoginView() } else { main }
+        }
+    }
+
+    var main: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                brandMark(size: 16, corner: 8)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("GitPulse").font(.headline)
+                    if !model.login.isEmpty { Text("@\(model.login)").font(.caption2).foregroundStyle(.secondary) }
+                }
+                Spacer()
+                Text("\(model.unreadCount)").font(.headline)
+                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .background(model.unreadCount > 0 ? Color.red.opacity(0.18) : Color.gray.opacity(0.15))
+                    .clipShape(Capsule())
+                Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    .buttonStyle(.borderless).help("Settings")
+            }
+
+            HStack(spacing: 8) {
+                Button { model.refresh(triggerNotify: false) } label: { Label("Fetch", systemImage: "arrow.clockwise") }
+                Button("Mark all read") { confirmAll = true }
+                Spacer()
+                if model.loading { ProgressView().controlSize(.small) }
+            }.font(.callout)
+
+            if model.rows.isEmpty {
+                Text(model.loading ? "Loading…" : "Nothing matching your filters.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 120)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.rows) { r in row(r); Divider() }
                     }
                 }
+                .frame(height: 360)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.textBackgroundColor)))
             }
-            .frame(minHeight: 200)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.textBackgroundColor)))
 
-            Text("Double-click or ⌘-click a row to open it on GitHub.").font(.caption2).foregroundStyle(.tertiary)
+            Text(model.status).font(.caption2).foregroundStyle(.tertiary)
         }
-        .padding(18).frame(minWidth: 760, minHeight: 620)
+        .padding(12).frame(width: 440)
+        .sheet(isPresented: $showSettings) { SettingsView().environmentObject(model) }
+        .confirmationDialog("Mark ALL notifications as read?", isPresented: $confirmAll, titleVisibility: .visible) {
+            Button("Mark all read", role: .destructive) { model.markAllRead() }
+            Button("Cancel", role: .cancel) {}
+        }
         .onAppear { if model.login.isEmpty { model.fetchUser() } }
     }
-}
 
-// MARK: - Menu bar content
-struct MenuContent: View {
-    @EnvironmentObject var model: AppModel
-    @Environment(\.openWindow) private var openWindow
-    var body: some View {
-        Text(model.login.isEmpty ? "GitPulse" : "GitPulse · @\(model.login)")
-        Text("\(model.unreadCount) unread (selected types)")
-        Divider()
-        Button("Open GitPulse window") {
-            NSApp.setActivationPolicy(.regular)
-            openWindow(id: "main")
-            NSApp.activate(ignoringOtherApps: true)
+    func row(_ r: Notif) -> some View {
+        HStack(spacing: 8) {
+            Circle().fill(r.unread ? Color.accentColor : Color.clear).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(r.title).font(.callout).lineLimit(2)
+                Text("\(r.repo) · \(r.reason)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Button { model.markThreadRead(r.id) } label: { Image(systemName: "checkmark.circle") }
+                .buttonStyle(.borderless).help("Mark as read")
+            Button { model.open(r.id) } label: { Image(systemName: "arrow.up.right.square") }
+                .buttonStyle(.borderless).help("Open on GitHub")
         }
-        Button("Open GitHub notifications") { NSWorkspace.shared.open(URL(string: "https://github.com/notifications")!) }
-        Button("Fetch now") { model.refresh(triggerNotify: false) }
-        Button("Test notification") { model.testNotification() }
-        Divider()
-        Button("Quit GitPulse") { NSApp.terminate(nil) }
+        .padding(.vertical, 6).padding(.horizontal, 6)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { model.open(r.id) }
+        .simultaneousGesture(TapGesture().modifiers(.command).onEnded { model.open(r.id) })
+        .contextMenu {
+            Button("Open on GitHub") { model.open(r.id) }
+            Button("Mark as read") { model.markThreadRead(r.id) }
+        }
     }
 }
 
-// MARK: - Root + App
-struct RootView: View {
-    @EnvironmentObject var model: AppModel
-    var body: some View { Group { if model.token == nil { LoginView() } else { ContentView() } } }
+// MARK: - App delegate
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    func applicationDidFinishLaunching(_ n: Notification) {
+        NSApp.setActivationPolicy(.accessory)   // never in the Dock
+        UNUserNotificationCenter.current().delegate = self
+        AppModel.shared.requestNotifAuth()
+        AppModel.shared.bootstrap()
+    }
+    func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
+                                withCompletionHandler h: @escaping (UNNotificationPresentationOptions) -> Void) {
+        h([.banner, .sound])
+    }
+    func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
+                                withCompletionHandler h: @escaping () -> Void) {
+        if let s = r.notification.request.content.userInfo["url"] as? String, let u = URL(string: s) {
+            NSWorkspace.shared.open(u)
+        }
+        h()
+    }
 }
 
+// MARK: - App
 @main
 struct GitPulseApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @ObservedObject var model = AppModel.shared
     var body: some Scene {
-        WindowGroup("GitPulse", id: "main") { RootView().environmentObject(model) }
-            .defaultSize(width: 880, height: 660)
         MenuBarExtra {
-            MenuContent().environmentObject(model)
+            PanelView().environmentObject(model)
         } label: {
-            // bell + unread count in the menu bar
             if model.unreadCount > 0 {
                 Label("\(model.unreadCount)", systemImage: "bell.badge.fill")
             } else {
                 Image(systemName: "bell")
             }
         }
+        .menuBarExtraStyle(.window)
     }
 }
