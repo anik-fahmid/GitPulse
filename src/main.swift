@@ -45,6 +45,7 @@ struct GitHub {
         r.setValue("GitPulse", forHTTPHeaderField: "User-Agent")
         if body != nil { r.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         r.httpBody = body
+        r.timeoutInterval = 30
         URLSession.shared.dataTask(with: r) { d, resp, _ in
             completion(d, (resp as? HTTPURLResponse)?.statusCode ?? -1)
         }.resume()
@@ -127,6 +128,9 @@ final class AppModel: ObservableObject {
     private var seen = Set<String>()
     private var seeded = false
     private var timer: Timer?
+    // Locally marked-read items — suppressed even if the API still returns them briefly.
+    private var readKeys = Set<String>()
+    private func key(_ n: Notif) -> String { "\(n.id):\(n.updated)" }
 
     private init() {
         let c = loadConfig()
@@ -216,8 +220,8 @@ final class AppModel: ObservableObject {
     func refresh(triggerNotify: Bool) {
         guard let token = token else { return }
         DispatchQueue.main.async { self.loading = true; self.status = "Fetching…" }
-        let allFlag = unreadOnly ? "false" : "true"
-        GitHub.req("https://api.github.com/notifications?all=\(allFlag)&per_page=50", token: token) { d, code in
+        // Always fetch UNREAD only — this app reviews unread notifications.
+        GitHub.req("https://api.github.com/notifications?all=false&per_page=50", token: token) { d, code in
             var parsed: [Notif] = []
             if code == 200, let d = d, let arr = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] {
                 for n in arr {
@@ -237,7 +241,7 @@ final class AppModel: ObservableObject {
                 self.loading = false
                 if code == 401 { self.signOut(); self.status = "Signed out (token invalid)"; return }
                 if code != 200 { self.status = "API error \(code)"; return }
-                let matching = parsed.filter { self.matches($0) }
+                let matching = parsed.filter { self.matches($0) && !self.readKeys.contains(self.key($0)) }
                 self.rows = matching
                 self.unreadCount = matching.filter { $0.unread }.count
                 self.status = "\(matching.count) shown · \(self.unreadCount) unread"
@@ -296,31 +300,47 @@ final class AppModel: ObservableObject {
     }
     func markAllRead() {
         guard let token = token else { return }
+        // Optimistic: clear + suppress immediately (no spinner, no reappearance).
+        let cleared = rows
+        for r in rows { readKeys.insert(key(r)) }
+        rows = []; unreadCount = 0; updateBadge(); status = "Marking all read…"
         let body = try? JSONSerialization.data(withJSONObject: ["read": true])
         GitHub.req("https://api.github.com/notifications", method: "PUT", token: token, body: body) { _, code in
             DispatchQueue.main.async {
-                if code == 205 || code == 202 || code == 200 {
-                    self.rows = []; self.unreadCount = 0; self.updateBadge()
-                    self.seen.removeAll(); self.seeded = false
+                if (200...205).contains(code) {
                     self.status = "All marked read"
-                } else { self.status = "Mark all read failed (\(code))" }
-                self.refresh(triggerNotify: false)
+                } else {
+                    // Roll back on failure.
+                    for r in cleared { self.readKeys.remove(self.key(r)) }
+                    self.rows = cleared
+                    self.unreadCount = cleared.filter { $0.unread }.count
+                    self.updateBadge()
+                    self.status = "Mark all read failed (\(code))"
+                }
             }
         }
     }
 
-    // Mark a single notification thread as read.
+    // Mark a single notification thread as read (optimistic + suppression).
     func markThreadRead(_ id: Notif.ID) {
         guard let token = token else { return }
+        let removed = rows.first { $0.id == id }
+        if let r = removed { readKeys.insert(key(r)) }
+        rows.removeAll { $0.id == id }
+        unreadCount = rows.filter { $0.unread }.count
+        updateBadge()
         GitHub.req("https://api.github.com/notifications/threads/\(id)", method: "PATCH", token: token) { _, code in
             DispatchQueue.main.async {
                 if (200...205).contains(code) {
-                    self.rows.removeAll { $0.id == id }
-                    self.seen.insert(id)
+                    self.status = "Marked read"
+                } else if let r = removed {
+                    // Roll back.
+                    self.readKeys.remove(self.key(r))
+                    self.rows.insert(r, at: 0)
                     self.unreadCount = self.rows.filter { $0.unread }.count
                     self.updateBadge()
-                    self.status = "Marked read"
-                } else { self.status = "Mark read failed (\(code))" }
+                    self.status = "Mark read failed (\(code))"
+                }
             }
         }
     }
@@ -440,7 +460,6 @@ struct SettingsView: View {
                 }.labelsHidden().frame(width: 190).disabled(!model.notify)
                 Button("Test") { model.testNotification() }
             }.font(.callout)
-            Toggle("Unread only", isOn: $model.unreadOnly).toggleStyle(.checkbox)
 
             Divider()
             Text("Notification types (drives badge + alerts)").font(.caption).foregroundStyle(.secondary)
@@ -500,7 +519,6 @@ struct SettingsView: View {
 struct PanelView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
-    @State private var confirmAll = false
 
     func openSettings() {
         NSApp.activate(ignoringOtherApps: true)
@@ -532,7 +550,7 @@ struct PanelView: View {
 
             HStack(spacing: 8) {
                 Button { model.refresh(triggerNotify: false) } label: { Label("Fetch", systemImage: "arrow.clockwise") }
-                Button("Mark all read") { confirmAll = true }
+                Button("Mark all read") { model.markAllRead() }
                 if model.loading { ProgressView().controlSize(.small) }
                 Spacer()
                 Button { NSApp.terminate(nil) } label: { Label("Quit", systemImage: "power") }
@@ -556,10 +574,6 @@ struct PanelView: View {
             Text(model.status).font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(12).frame(width: 440)
-        .confirmationDialog("Mark ALL notifications as read?", isPresented: $confirmAll, titleVisibility: .visible) {
-            Button("Mark all read", role: .destructive) { model.markAllRead() }
-            Button("Cancel", role: .cancel) {}
-        }
         .onAppear { if model.login.isEmpty { model.fetchUser() } }
     }
 
