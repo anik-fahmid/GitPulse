@@ -9,7 +9,7 @@ BIN="GitPulse"
 
 echo "==> Compiling…"
 swiftc -O -parse-as-library src/main.swift -o "$BIN" \
-    -framework SwiftUI -framework AppKit -framework UserNotifications
+    -framework SwiftUI -framework AppKit -framework UserNotifications -framework LocalAuthentication
 
 echo "==> Building app bundle…"
 rm -rf "$APP"

@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Security
 import UserNotifications
+import LocalAuthentication
 
 // MARK: - OAuth config
 let CLIENT_ID = "Ov23lip4576LQSrJsiv1"
@@ -114,6 +115,7 @@ struct Config: Codable {
     var repos = ""; var reasons = Array(DEFAULT_REASONS); var unreadOnly = true
     var notify = false; var intervalSeconds = 1800
     var selectedRepos: [String] = []
+    var requireTouchID = false
 }
 func configURL() -> URL {
     let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gh-notif-reviewer")
@@ -144,6 +146,8 @@ final class AppModel: ObservableObject {
     @Published var loadingRepos = false
     @Published var updateTag: String? = nil
     @Published var updateURL = "https://github.com/\(REPO_SLUG)/releases/latest"
+    @Published var requireTouchID: Bool { didSet { persist() } }
+    @Published var locked = false
 
     private var seen = Set<String>()
     private var seeded = false
@@ -163,9 +167,30 @@ final class AppModel: ObservableObject {
         repos = c.repos; reasons = Set(c.reasons); unreadOnly = c.unreadOnly
         notify = c.notify; intervalSeconds = c.intervalSeconds
         selectedRepos = Set(c.selectedRepos)
+        requireTouchID = c.requireTouchID
     }
 
-    func persist() { saveConfig(Config(repos: repos, reasons: Array(reasons), unreadOnly: unreadOnly, notify: notify, intervalSeconds: intervalSeconds, selectedRepos: Array(selectedRepos))) }
+    func persist() { saveConfig(Config(repos: repos, reasons: Array(reasons), unreadOnly: unreadOnly, notify: notify, intervalSeconds: intervalSeconds, selectedRepos: Array(selectedRepos), requireTouchID: requireTouchID)) }
+
+    // ---- Touch ID lock ----
+    func authenticate() {
+        let ctx = LAContext()
+        ctx.localizedFallbackTitle = "Use Password"
+        var err: NSError?
+        guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) else {
+            // No biometrics/passcode available — don't lock the user out.
+            DispatchQueue.main.async { self.locked = false; self.startCore() }
+            return
+        }
+        ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock GitPulse") { ok, _ in
+            DispatchQueue.main.async {
+                if ok { self.locked = false; self.startCore() } else { self.locked = true }
+            }
+        }
+    }
+    private func startCore() {
+        fetchUser(); refresh(triggerNotify: false); reschedule(); checkForUpdates()
+    }
 
     // Load all repositories the token can access (paginated).
     func fetchRepos() {
@@ -222,7 +247,12 @@ final class AppModel: ObservableObject {
     // ---- polling ----
     func bootstrap() {
         guard token != nil else { return }
-        fetchUser(); refresh(triggerNotify: false); reschedule(); checkForUpdates()
+        if requireTouchID {
+            locked = true
+            authenticate()   // prompt Touch ID; startCore() runs only on success
+        } else {
+            startCore()
+        }
     }
 
     // ---- update check (lightweight, via GitHub Releases) ----
@@ -587,6 +617,11 @@ struct SettingsView: View {
             }
 
             Divider()
+            Toggle("Require Touch ID to open GitPulse", isOn: $model.requireTouchID).toggleStyle(.switch)
+            Text("Locks the app at launch; unlock with Touch ID (or your Mac password).")
+                .font(.caption2).foregroundStyle(.tertiary)
+
+            Divider()
             HStack {
                 Button("Check for updates") { model.checkForUpdates(manual: true) }
                 if let tag = model.updateTag {
@@ -605,6 +640,26 @@ struct SettingsView: View {
     }
 }
 
+// MARK: - Lock screen (Touch ID)
+struct LockView: View {
+    @EnvironmentObject var model: AppModel
+    var body: some View {
+        VStack(spacing: 16) {
+            brandMark(size: 30, corner: 14)
+            Text("GitPulse is locked").font(.headline)
+            Text("Unlock with Touch ID to view your notifications.")
+                .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Button { model.authenticate() } label: {
+                Label("Unlock", systemImage: "touchid").padding(.horizontal, 8).padding(.vertical, 2)
+            }.buttonStyle(.borderedProminent)
+            Button { NSApp.terminate(nil) } label: { Label("Quit", systemImage: "power") }
+                .font(.caption).keyboardShortcut("q")
+        }
+        .padding(28).frame(width: 320)
+        .onAppear { model.authenticate() }   // prompt immediately when the panel opens
+    }
+}
+
 // MARK: - Panel (the whole app, in a menu-bar window)
 struct PanelView: View {
     @EnvironmentObject var model: AppModel
@@ -617,7 +672,9 @@ struct PanelView: View {
 
     var body: some View {
         Group {
-            if model.token == nil { LoginView() } else { main }
+            if model.token == nil { LoginView() }
+            else if model.locked { LockView() }
+            else { main }
         }
     }
 
