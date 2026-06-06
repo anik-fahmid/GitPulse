@@ -9,35 +9,39 @@ let CLIENT_ID = "Ov23lip4576LQSrJsiv1"
 let OAUTH_SCOPE = "notifications repo"
 let REPO_SLUG = "anik-fahmid/GitPulse"
 
-// MARK: - Token store (file-based, 0600 — avoids the Keychain access prompt on every launch)
+// MARK: - Token store (encrypted macOS Keychain, device-only)
 enum Keychain {
     static let service = "com.wedevs.gitpulse"
     static let account = "github-token"
-    private static var fileURL: URL {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gh-notif-reviewer")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(".token")
+    private static var legacyFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gh-notif-reviewer").appendingPathComponent(".token")
     }
     static func save(_ token: String) {
-        try? token.data(using: .utf8)?.write(to: fileURL, options: .atomic)
-        // Lock down to owner read/write only.
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-        keychainClear()   // remove any legacy keychain copy
+        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                   kSecAttrService as String: service, kSecAttrAccount as String: account]
+        SecItemDelete(base as CFDictionary)
+        var add = base
+        add[kSecValueData as String] = token.data(using: .utf8)!
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        SecItemAdd(add as CFDictionary, nil)
+        try? FileManager.default.removeItem(at: legacyFileURL)   // clean up any v3.6 plaintext token
     }
     static func load() -> String? {
-        if let d = try? Data(contentsOf: fileURL), let s = String(data: d, encoding: .utf8), !s.isEmpty {
-            return s
+        if let t = keychainRead() { return t }
+        // One-time migration from the v3.6 plaintext file into the Keychain.
+        if let d = try? Data(contentsOf: legacyFileURL), let s = String(data: d, encoding: .utf8), !s.isEmpty {
+            save(s); return s
         }
-        // One-time migration from the old Keychain item.
-        if let legacy = keychainLoad() { save(legacy); return legacy }
         return nil
     }
     static func clear() {
-        try? FileManager.default.removeItem(at: fileURL)
-        keychainClear()
+        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                   kSecAttrService as String: service, kSecAttrAccount as String: account]
+        SecItemDelete(base as CFDictionary)
+        try? FileManager.default.removeItem(at: legacyFileURL)
     }
-    // --- legacy keychain helpers (migration only) ---
-    private static func keychainLoad() -> String? {
+    private static func keychainRead() -> String? {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrService as String: service, kSecAttrAccount as String: account,
                                 kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
@@ -45,11 +49,6 @@ enum Keychain {
         guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
               let d = item as? Data, let s = String(data: d, encoding: .utf8) else { return nil }
         return s
-    }
-    private static func keychainClear() {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                kSecAttrService as String: service, kSecAttrAccount as String: account]
-        SecItemDelete(q as CFDictionary)
     }
 }
 
