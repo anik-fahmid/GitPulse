@@ -52,7 +52,20 @@ GitHub's notification inbox is noisy. GitPulse lives in your menu bar, shows an 
 ### Download (recommended)
 1. Grab `GitPulse.dmg` from the [latest release](https://github.com/anik-fahmid/GitPulse/releases/latest).
 2. Open the DMG, drag **GitPulse** into **Applications**.
-3. First launch: the app is ad-hoc signed, so **right-click → Open** once to bypass Gatekeeper.
+3. First launch — see *Opening an unsigned app* below.
+
+### Opening an unsigned app (first launch)
+
+GitPulse is ad-hoc signed (not notarized), so macOS Gatekeeper warns on first launch. Use any one:
+
+- **System Settings** (most reliable on macOS 15+): double-click GitPulse → click **Done** on the warning → open **System Settings → Privacy & Security** → next to *"GitPulse was blocked…"* click **Open Anyway** → confirm.
+- **Right-click**: Control-click GitPulse in Applications → **Open** → **Open** again.
+- **Terminal**: remove the quarantine flag, then open normally:
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/GitPulse.app
+  ```
+
+You only need to do this once.
 
 ### Build from source
 ```bash
