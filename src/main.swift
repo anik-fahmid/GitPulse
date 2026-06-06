@@ -134,6 +134,10 @@ final class AppModel: ObservableObject {
     // Locally marked-read items — suppressed even if the API still returns them briefly.
     private var readKeys = Set<String>()
     private func key(_ n: Notif) -> String { "\(n.id):\(n.updated)" }
+    private func capSets() {
+        if seen.count > 1000 { seen = Set(seen.suffix(1000)) }
+        if readKeys.count > 1000 { readKeys = Set(readKeys.suffix(1000)) }
+    }
 
     private init() {
         let c = loadConfig()
@@ -298,11 +302,13 @@ final class AppModel: ObservableObject {
                 self.status = "\(matching.count) shown · \(self.unreadCount) unread"
                 self.updateBadge()
 
-                let newUnread = matching.filter { $0.unread && !self.seen.contains($0.id) }
+                // Dedup by id+updated so NEW activity on a known thread still alerts.
+                let newUnread = matching.filter { $0.unread && !self.seen.contains(self.key($0)) }
                 if !self.seeded {
-                    self.seen.formUnion(matching.map { $0.id }); self.seeded = true; return
+                    self.seen.formUnion(matching.map { self.key($0) }); self.seeded = true; self.capSets(); return
                 }
-                self.seen.formUnion(newUnread.map { $0.id })
+                self.seen.formUnion(newUnread.map { self.key($0) })
+                self.capSets()
                 if triggerNotify && self.notify {
                     for n in newUnread { self.postNotification(for: n) }
                 }
@@ -366,7 +372,8 @@ final class AppModel: ObservableObject {
                     self.rows = cleared
                     self.unreadCount = cleared.filter { $0.unread }.count
                     self.updateBadge()
-                    self.status = "Mark all read failed (\(code))"
+                    if code == 401 { self.signOut(); self.status = "Signed out (token invalid)" }
+                    else { self.status = "Mark all read failed (\(code))" }
                 }
             }
         }
@@ -390,7 +397,8 @@ final class AppModel: ObservableObject {
                     self.rows.insert(r, at: 0)
                     self.unreadCount = self.rows.filter { $0.unread }.count
                     self.updateBadge()
-                    self.status = "Mark read failed (\(code))"
+                    if code == 401 { self.signOut(); self.status = "Signed out (token invalid)" }
+                    else { self.status = "Mark read failed (\(code))" }
                 }
             }
         }
