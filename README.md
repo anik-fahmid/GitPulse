@@ -118,4 +118,4 @@ Issues and PRs welcome. Ideas on the [roadmap](#-roadmap) are a good place to st
 
 ## 🙏 Credits
 
-Built by [@anik-fahmid](https://github.com/anik-fahmid). Icon and app crafted with a little help from Claude.
+Built by [@anik-fahmid](https://github.com/anik-fahmid). 
