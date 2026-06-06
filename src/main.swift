@@ -145,6 +145,7 @@ final class AppModel: ObservableObject {
     @Published var loadingRepos = false
     @Published var updateTag: String? = nil
     @Published var updateURL = "https://github.com/\(REPO_SLUG)/releases/latest"
+    @Published var updateMessage = ""
     @Published var requireTouchID: Bool { didSet { persist() } }
     @Published var locked = false
 
@@ -276,17 +277,19 @@ final class AppModel: ObservableObject {
             guard code == 200, let d = d,
                   let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
                   let tag = j["tag_name"] as? String else {
-                if manual { DispatchQueue.main.async { self.status = "Update check failed" } }
+                if manual { DispatchQueue.main.async { self.updateMessage = "Update check failed"; self.status = "Update check failed" } }
                 return
             }
             let page = (j["html_url"] as? String) ?? self.updateURL
             DispatchQueue.main.async {
                 if self.versionIsNewer(tag, than: self.currentVersion()) {
                     self.updateTag = tag; self.updateURL = page
-                    if manual { self.status = "Update available: \(tag)" }
+                    let msg = "Update available: \(tag)"
+                    self.updateMessage = msg; if manual { self.status = msg }
                 } else {
                     self.updateTag = nil
-                    if manual { self.status = "You're on the latest (\(self.currentVersion()))" }
+                    let msg = "You're on the latest version (v\(self.currentVersion())) ✓"
+                    self.updateMessage = msg; if manual { self.status = msg }
                 }
             }
         }
@@ -381,13 +384,39 @@ final class AppModel: ObservableObject {
         }
     }
     func testNotification() {
-        requestNotifAuth()
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            switch settings.authorizationStatus {
+            case .denied:
+                DispatchQueue.main.async {
+                    self.status = "Notifications are OFF for GitPulse — enable in System Settings ▸ Notifications"
+                }
+            case .notDetermined:
+                center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+                    DispatchQueue.main.async {
+                        if granted { self.postTest() }
+                        else { self.status = "Notification permission was not granted" }
+                    }
+                }
+            default:
+                self.postTest()
+            }
+        }
+    }
+    private func postTest() {
         let c = UNMutableNotificationContent()
         c.title = "GitPulse test"
         c.body = "Notifications work. Click to open GitHub."
         c.sound = .default
         c.userInfo = ["url": "https://github.com/notifications"]
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "gp-test-\(UUID().uuidString)", content: c, trigger: nil))
+        // Tiny trigger (not nil) so it reliably presents even while the app is active.
+        let trig = UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
+        let req = UNNotificationRequest(identifier: "gp-test-\(UUID().uuidString)", content: c, trigger: trig)
+        UNUserNotificationCenter.current().add(req) { err in
+            DispatchQueue.main.async {
+                self.status = err == nil ? "Test notification sent" : "Notification error: \(err!.localizedDescription)"
+            }
+        }
     }
 
     func resolveURL(_ n: Notif, completion: @escaping (String) -> Void) {
@@ -628,6 +657,10 @@ struct SettingsView: View {
                 }
                 Spacer()
                 Text("v\(model.currentVersion())").font(.caption).foregroundStyle(.secondary)
+            }
+            if !model.updateMessage.isEmpty {
+                Text(model.updateMessage).font(.caption)
+                    .foregroundStyle(model.updateTag == nil ? Color.secondary : Color.green)
             }
             HStack {
                 Button(role: .destructive) { model.signOut(); dismiss() } label: { Text("Sign out") }
