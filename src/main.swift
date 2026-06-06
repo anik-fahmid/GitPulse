@@ -8,18 +8,35 @@ let CLIENT_ID = "Ov23lip4576LQSrJsiv1"
 let OAUTH_SCOPE = "notifications repo"
 let REPO_SLUG = "anik-fahmid/GitPulse"
 
-// MARK: - Keychain
+// MARK: - Token store (file-based, 0600 — avoids the Keychain access prompt on every launch)
 enum Keychain {
     static let service = "com.wedevs.gitpulse"
     static let account = "github-token"
+    private static var fileURL: URL {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gh-notif-reviewer")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(".token")
+    }
     static func save(_ token: String) {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                kSecAttrService as String: service, kSecAttrAccount as String: account]
-        SecItemDelete(q as CFDictionary)
-        var add = q; add[kSecValueData as String] = token.data(using: .utf8)!
-        SecItemAdd(add as CFDictionary, nil)
+        try? token.data(using: .utf8)?.write(to: fileURL, options: .atomic)
+        // Lock down to owner read/write only.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        keychainClear()   // remove any legacy keychain copy
     }
     static func load() -> String? {
+        if let d = try? Data(contentsOf: fileURL), let s = String(data: d, encoding: .utf8), !s.isEmpty {
+            return s
+        }
+        // One-time migration from the old Keychain item.
+        if let legacy = keychainLoad() { save(legacy); return legacy }
+        return nil
+    }
+    static func clear() {
+        try? FileManager.default.removeItem(at: fileURL)
+        keychainClear()
+    }
+    // --- legacy keychain helpers (migration only) ---
+    private static func keychainLoad() -> String? {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrService as String: service, kSecAttrAccount as String: account,
                                 kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
@@ -28,7 +45,7 @@ enum Keychain {
               let d = item as? Data, let s = String(data: d, encoding: .utf8) else { return nil }
         return s
     }
-    static func clear() {
+    private static func keychainClear() {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrService as String: service, kSecAttrAccount as String: account]
         SecItemDelete(q as CFDictionary)
@@ -134,6 +151,8 @@ final class AppModel: ObservableObject {
     // Locally marked-read items — suppressed even if the API still returns them briefly.
     private var readKeys = Set<String>()
     private func key(_ n: Notif) -> String { "\(n.id):\(n.updated)" }
+    // In-flight mark-read writes; quitting waits for these so reads actually persist.
+    var pendingWrites = 0
     private func capSets() {
         if seen.count > 1000 { seen = Set(seen.suffix(1000)) }
         if readKeys.count > 1000 { readKeys = Set(readKeys.suffix(1000)) }
@@ -362,8 +381,10 @@ final class AppModel: ObservableObject {
         for r in rows { readKeys.insert(key(r)) }
         rows = []; unreadCount = 0; updateBadge(); status = "Marking all read…"
         let body = try? JSONSerialization.data(withJSONObject: ["read": true])
+        pendingWrites += 1
         GitHub.req("https://api.github.com/notifications", method: "PUT", token: token, body: body) { _, code in
             DispatchQueue.main.async {
+                self.pendingWrites -= 1
                 if (200...205).contains(code) {
                     self.status = "All marked read"
                 } else {
@@ -387,8 +408,10 @@ final class AppModel: ObservableObject {
         rows.removeAll { $0.id == id }
         unreadCount = rows.filter { $0.unread }.count
         updateBadge()
+        pendingWrites += 1
         GitHub.req("https://api.github.com/notifications/threads/\(id)", method: "PATCH", token: token) { _, code in
             DispatchQueue.main.async {
+                self.pendingWrites -= 1
                 if (200...205).contains(code) {
                     self.status = "Marked read"
                 } else if let r = removed {
@@ -683,6 +706,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         UNUserNotificationCenter.current().delegate = self
         AppModel.shared.requestNotifAuth()
         AppModel.shared.bootstrap()
+    }
+    // Don't quit while mark-read writes are still in flight (else they never persist).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if AppModel.shared.pendingWrites <= 0 { return .terminateNow }
+        DispatchQueue.global().async {
+            let start = Date()
+            while AppModel.shared.pendingWrites > 0 && Date().timeIntervalSince(start) < 6 { usleep(100_000) }
+            DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
     }
     func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
                                 withCompletionHandler h: @escaping (UNNotificationPresentationOptions) -> Void) {

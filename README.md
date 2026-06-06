@@ -40,7 +40,7 @@ GitHub's notification inbox is noisy. GitPulse lives in your menu bar, shows an 
 
 **Private & lightweight**
 - Built-in **Sign in with GitHub** (OAuth Device Flow) or a **Personal Access Token**.
-- Token is stored only in the **macOS Keychain** — never in the app or config files.
+- Token is stored in a private file (`~/.gh-notif-reviewer/.token`, owner-only `0600`) — never in the app bundle.
 
 ## 📦 Requirements
 
@@ -69,7 +69,7 @@ GitPulse talks to the GitHub REST API directly — pick either:
 - **Sign in with GitHub** (OAuth Device Flow): click the button, approve the code in your browser.
 - **Personal Access Token**: paste a classic token with `notifications` + `repo` scope. **Required for private org repos** when the OAuth app isn't org-approved (e.g. free-plan orgs with third-party app restrictions). [Create one here](https://github.com/settings/tokens/new?scopes=notifications,repo&description=GitPulse).
 
-Your token lives only in the macOS Keychain.
+Your token is saved locally in `~/.gh-notif-reviewer/.token` (owner-only permissions).
 
 ## ⌨️ Usage
 
@@ -92,11 +92,11 @@ Your token lives only in the macOS Keychain.
 
 ## 🛠️ Tech stack
 
-SwiftUI · AppKit · UserNotifications · Security (Keychain) · GitHub REST API.
+SwiftUI · AppKit · UserNotifications · GitHub REST API.
 
 ## 🔒 Privacy
 
-GitPulse makes requests only to `api.github.com` and `github.com` (for sign-in). It stores your token in the Keychain and your filter preferences in `~/.gh-notif-reviewer/config.json`. Nothing else leaves your machine.
+GitPulse makes requests only to `api.github.com` and `github.com` (for sign-in). It stores your token and filter preferences locally under `~/.gh-notif-reviewer/` (token file is `0600`). Nothing else leaves your machine.
 
 ## 🤝 Contributing
 
