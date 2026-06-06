@@ -6,6 +6,7 @@ import UserNotifications
 // MARK: - OAuth config
 let CLIENT_ID = "Ov23lip4576LQSrJsiv1"
 let OAUTH_SCOPE = "notifications repo"
+let REPO_SLUG = "anik-fahmid/GitPulse"
 
 // MARK: - Keychain
 enum Keychain {
@@ -124,6 +125,8 @@ final class AppModel: ObservableObject {
     @Published var selectedRepos: Set<String> { didSet { persist() } }
     @Published var allRepos: [String] = []
     @Published var loadingRepos = false
+    @Published var updateTag: String? = nil
+    @Published var updateURL = "https://github.com/\(REPO_SLUG)/releases/latest"
 
     private var seen = Set<String>()
     private var seeded = false
@@ -196,8 +199,56 @@ final class AppModel: ObservableObject {
     // ---- polling ----
     func bootstrap() {
         guard token != nil else { return }
-        fetchUser(); refresh(triggerNotify: false); reschedule()
+        fetchUser(); refresh(triggerNotify: false); reschedule(); checkForUpdates()
     }
+
+    // ---- update check (lightweight, via GitHub Releases) ----
+    func currentVersion() -> String {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0"
+    }
+    private func versionIsNewer(_ tag: String, than current: String) -> Bool {
+        func parts(_ s: String) -> [Int] {
+            s.lowercased().replacingOccurrences(of: "v", with: "")
+                .split(separator: ".").map { Int($0) ?? 0 }
+        }
+        let a = parts(tag), b = parts(current)
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0, y = i < b.count ? b[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+    func checkForUpdates(manual: Bool = false) {
+        let api = "https://api.github.com/repos/\(REPO_SLUG)/releases/latest"
+        let handle: (Data?, Int) -> Void = { d, code in
+            guard code == 200, let d = d,
+                  let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let tag = j["tag_name"] as? String else {
+                if manual { DispatchQueue.main.async { self.status = "Update check failed" } }
+                return
+            }
+            let page = (j["html_url"] as? String) ?? self.updateURL
+            DispatchQueue.main.async {
+                if self.versionIsNewer(tag, than: self.currentVersion()) {
+                    self.updateTag = tag; self.updateURL = page
+                    if manual { self.status = "Update available: \(tag)" }
+                } else {
+                    self.updateTag = nil
+                    if manual { self.status = "You're on the latest (\(self.currentVersion()))" }
+                }
+            }
+        }
+        if let t = token { GitHub.req(api, token: t, completion: handle) }
+        else {
+            var r = URLRequest(url: URL(string: api)!)
+            r.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            r.setValue("GitPulse", forHTTPHeaderField: "User-Agent")
+            URLSession.shared.dataTask(with: r) { d, resp, _ in
+                handle(d, (resp as? HTTPURLResponse)?.statusCode ?? -1)
+            }.resume()
+        }
+    }
+    func openUpdate() { if let u = URL(string: updateURL) { NSWorkspace.shared.open(u) } }
     func reschedule() {
         timer?.invalidate(); timer = nil
         guard token != nil else { return }
@@ -506,12 +557,20 @@ struct SettingsView: View {
 
             Divider()
             HStack {
+                Button("Check for updates") { model.checkForUpdates(manual: true) }
+                if let tag = model.updateTag {
+                    Button { model.openUpdate() } label: { Text("Get \(tag)") }.tint(.green)
+                }
+                Spacer()
+                Text("v\(model.currentVersion())").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
                 Button(role: .destructive) { model.signOut(); dismiss() } label: { Text("Sign out") }
                 Spacer()
                 Text(model.login.isEmpty ? "" : "@\(model.login)").font(.caption).foregroundStyle(.secondary)
             }
         }
-        .padding(16).frame(width: 470, height: 640)
+        .padding(16).frame(width: 470, height: 680)
     }
 }
 
@@ -546,6 +605,14 @@ struct PanelView: View {
                     .clipShape(Capsule())
                 Button { openSettings() } label: { Image(systemName: "gearshape") }
                     .buttonStyle(.borderless).help("Settings")
+            }
+
+            if let tag = model.updateTag {
+                Button { model.openUpdate() } label: {
+                    Label("Update available → \(tag)", systemImage: "arrow.down.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent).tint(.green).controlSize(.small)
             }
 
             HStack(spacing: 8) {

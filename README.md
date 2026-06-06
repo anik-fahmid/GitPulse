@@ -104,6 +104,7 @@ Issues and PRs welcome. Ideas on the [roadmap](#-roadmap) are a good place to st
 
 ## 🗺️ Roadmap
 
+- [x] In-app update check (notifies when a newer release is available)
 - [ ] Launch at login toggle
 - [ ] Notarized & signed builds (no Gatekeeper prompt)
 - [ ] Universal binary (Intel + Apple Silicon)
