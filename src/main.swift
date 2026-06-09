@@ -64,6 +64,9 @@ struct GitHub {
         if body != nil { r.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         r.httpBody = body
         r.timeoutInterval = 30
+        // GitHub notifications send Cache-Control: max-age=60. The shared URLCache
+        // would otherwise return a stale list (or a cached 304 body) on Fetch.
+        r.cachePolicy = .reloadIgnoringLocalCacheData
         URLSession.shared.dataTask(with: r) { d, resp, _ in
             completion(d, (resp as? HTTPURLResponse)?.statusCode ?? -1)
         }.resume()
@@ -106,8 +109,9 @@ let DEFAULT_REASONS: Set<String> = ["mention", "team_mention", "review_requested
 
 // Reminder interval choices (seconds). Realtime = 30 min min-gap.
 let INTERVALS: [(label: String, seconds: Int)] = [
-    ("Realtime (30 min)", 1800), ("Every 1 hour", 3600), ("Every 2 hours", 7200),
-    ("Every 4 hours", 14400), ("Every 8 hours", 28800), ("Daily", 86400),
+    ("Realtime (1 min)", 60), ("Every 5 min", 300), ("Every 15 min", 900),
+    ("Every 30 min", 1800), ("Every 1 hour", 3600), ("Every 4 hours", 14400),
+    ("Every 8 hours", 28800), ("Daily", 86400),
 ]
 
 struct Config: Codable {
@@ -307,7 +311,7 @@ final class AppModel: ObservableObject {
     func reschedule() {
         timer?.invalidate(); timer = nil
         guard token != nil else { return }
-        let secs = max(1800, intervalSeconds)   // enforce 30-min minimum gap
+        let secs = max(60, intervalSeconds)   // GitHub poll-interval floor is ~60s
         timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(secs), repeats: true) { [weak self] _ in
             self?.refresh(triggerNotify: true)
         }
