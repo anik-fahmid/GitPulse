@@ -3,6 +3,7 @@ import AppKit
 import Security
 import UserNotifications
 import LocalAuthentication
+import UniformTypeIdentifiers
 
 // MARK: - OAuth config
 let CLIENT_ID = "Ov23lip4576LQSrJsiv1"
@@ -91,6 +92,106 @@ struct GitHub {
     }
 }
 
+// MARK: - Blog feeds (RSS / Atom)
+struct FeedEntry { let title: String; let link: String; let key: String }
+
+// Minimal RSS + Atom parser (Foundation XMLParser, no dependencies).
+final class FeedParser: NSObject, XMLParserDelegate {
+    private var entries: [FeedEntry] = []
+    private var inItem = false
+    private var text = ""
+    private var title = "", link = "", guid = ""
+    func parse(_ data: Data) -> [FeedEntry] {
+        let p = XMLParser(data: data); p.delegate = self; p.parse(); return entries
+    }
+    func parser(_ p: XMLParser, didStartElement name: String, namespaceURI: String?,
+                qualifiedName q: String?, attributes a: [String: String] = [:]) {
+        text = ""
+        let n = name.lowercased()
+        if n == "item" || n == "entry" { inItem = true; title = ""; link = ""; guid = "" }
+        // Atom links carry the URL in the href attribute (prefer rel="alternate").
+        if n == "link", inItem, let href = a["href"], !href.isEmpty,
+           (a["rel"] == nil || a["rel"] == "alternate") { link = href }
+    }
+    func parser(_ p: XMLParser, foundCharacters s: String) { text += s }
+    func parser(_ p: XMLParser, foundCDATA d: Data) { if let s = String(data: d, encoding: .utf8) { text += s } }
+    func parser(_ p: XMLParser, didEndElement name: String, namespaceURI: String?, qualifiedName q: String?) {
+        let n = name.lowercased()
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if inItem {
+            switch n {
+            case "title": if title.isEmpty { title = t }
+            case "link": if link.isEmpty, !t.isEmpty { link = t }   // RSS: URL is element text
+            case "guid", "id": if guid.isEmpty { guid = t }
+            case "item", "entry":
+                let key = !guid.isEmpty ? guid : link
+                if !key.isEmpty { entries.append(FeedEntry(title: title.isEmpty ? link : title, link: link, key: key)) }
+                inItem = false
+            default: break
+            }
+        }
+        text = ""
+    }
+}
+
+enum Feeds {
+    static func fetchData(_ url: URL, completion: @escaping (Data?, String) -> Void) {
+        var r = URLRequest(url: url); r.timeoutInterval = 20
+        r.setValue("GitPulse/1.0 (+feed reader)", forHTTPHeaderField: "User-Agent")
+        r.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: r) { d, resp, _ in
+            let ct = ((resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+            completion(d, ct)
+        }.resume()
+    }
+    // Fetch a URL, use it directly if it's a feed, else discover the feed link,
+    // else try common feed paths. Returns parsed entries (empty on failure).
+    static func discoverAndFetch(_ raw: String, completion: @escaping ([FeedEntry]) -> Void) {
+        guard let url = URL(string: raw) else { completion([]); return }
+        fetchData(url) { data, ctype in
+            guard let data = data else { completion([]); return }
+            let head = String(data: data.prefix(512), encoding: .utf8)?.lowercased() ?? ""
+            let looksFeed = ctype.contains("xml") || head.contains("<rss") || head.contains("<feed") || head.contains("<?xml")
+            if looksFeed {
+                let e = FeedParser().parse(data)
+                if !e.isEmpty { completion(e); return }
+            }
+            let html = String(data: data, encoding: .utf8) ?? ""
+            if let feedURL = findFeedLink(in: html, base: url) {
+                fetchData(feedURL) { d2, _ in completion(d2.map { FeedParser().parse($0) } ?? []) }
+                return
+            }
+            tryFallbacks(base: url, completion: completion)
+        }
+    }
+    static func findFeedLink(in html: String, base: URL) -> URL? {
+        let pattern = "<link[^>]+(?:application/rss\\+xml|application/atom\\+xml)[^>]*>"
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let ns = html as NSString
+        guard let m = re.firstMatch(in: html, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        let tag = ns.substring(with: m.range)
+        let tns = tag as NSString
+        guard let hre = try? NSRegularExpression(pattern: "href=[\"']([^\"']+)[\"']", options: [.caseInsensitive]),
+              let hm = hre.firstMatch(in: tag, range: NSRange(location: 0, length: tns.length)) else { return nil }
+        let href = tns.substring(with: hm.range(at: 1))
+        return URL(string: href, relativeTo: base)?.absoluteURL
+    }
+    static func tryFallbacks(base: URL, completion: @escaping ([FeedEntry]) -> Void) {
+        let paths = ["/feed", "/feed.xml", "/rss", "/rss.xml", "/atom.xml", "/index.xml"]
+        var i = 0
+        func next() {
+            if i >= paths.count { completion([]); return }
+            let p = paths[i]; i += 1
+            guard let u = URL(string: p, relativeTo: base)?.absoluteURL else { next(); return }
+            fetchData(u) { d, _ in
+                if let d = d { let e = FeedParser().parse(d); if !e.isEmpty { completion(e); return } }
+                next()
+            }
+        }
+        next()
+    }
+}
+
 // MARK: - Model
 struct Notif: Identifiable {
     let id: String, repo: String, type: String, reason: String
@@ -99,6 +200,7 @@ struct Notif: Identifiable {
     // not the notifications inbox). htmlURL lets us open without an extra API call.
     var htmlURL: String = ""
     var isIssue: Bool = false
+    var isPost: Bool = false   // synthetic "new blog post" rows
 }
 
 let REASONS: [(value: String, label: String)] = [
@@ -129,6 +231,11 @@ struct Config: Codable {
     var issueSince = ""
     // Repos watched for new-issue alerts — independent of selectedRepos.
     var issueRepos: [String] = []
+    // Blog-post watch: watchlist URLs, CSV seen-log path, per-URL seeded markers.
+    var watchBlogs = false
+    var blogURLs: [String] = []
+    var seenLogPath = ""
+    var blogSeeded: [String] = []
 }
 func configURL() -> URL {
     let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gh-notif-reviewer")
@@ -168,6 +275,15 @@ final class AppModel: ObservableObject {
     @Published var newIssues: [Notif] = []
     var issueSince: String
 
+    // Blog-post watch.
+    @Published var watchBlogs: Bool { didSet { persist(); startBlogTimer(); if watchBlogs { loadSeenLog(); refreshBlogs(triggerNotify: false) } } }
+    @Published var blogURLs: [String]
+    @Published var seenLogPath: String
+    @Published var newPosts: [Notif] = []
+    private var blogSeeded: Set<String>
+    private var postSeen = Set<String>()
+    private var blogTimer: Timer?
+
     private var seen = Set<String>()
     private var seeded = false
     private var issueSeen = Set<String>()
@@ -182,6 +298,7 @@ final class AppModel: ObservableObject {
         if seen.count > 1000 { seen = Set(seen.suffix(1000)) }
         if readKeys.count > 1000 { readKeys = Set(readKeys.suffix(1000)) }
         if issueSeen.count > 1000 { issueSeen = Set(issueSeen.suffix(1000)) }
+        if postSeen.count > 5000 { postSeen = Set(postSeen.suffix(5000)) }
     }
 
     private init() {
@@ -193,9 +310,13 @@ final class AppModel: ObservableObject {
         watchNewIssues = c.watchNewIssues
         issueSince = c.issueSince
         issueRepos = Set(c.issueRepos)
+        watchBlogs = c.watchBlogs
+        blogURLs = c.blogURLs
+        seenLogPath = c.seenLogPath
+        blogSeeded = Set(c.blogSeeded)
     }
 
-    func persist() { saveConfig(Config(repos: repos, reasons: Array(reasons), unreadOnly: unreadOnly, notify: notify, intervalSeconds: intervalSeconds, selectedRepos: Array(selectedRepos), requireTouchID: requireTouchID, watchNewIssues: watchNewIssues, issueSince: issueSince, issueRepos: Array(issueRepos))) }
+    func persist() { saveConfig(Config(repos: repos, reasons: Array(reasons), unreadOnly: unreadOnly, notify: notify, intervalSeconds: intervalSeconds, selectedRepos: Array(selectedRepos), requireTouchID: requireTouchID, watchNewIssues: watchNewIssues, issueSince: issueSince, issueRepos: Array(issueRepos), watchBlogs: watchBlogs, blogURLs: blogURLs, seenLogPath: seenLogPath, blogSeeded: Array(blogSeeded))) }
 
     // ---- Touch ID lock ----
     func authenticate() {
@@ -214,13 +335,26 @@ final class AppModel: ObservableObject {
         }
     }
     private func startCore() {
-        fetchUser(); fetchAll(triggerNotify: false); reschedule(); checkForUpdates()
+        fetchUser()
+        if watchBlogs { loadSeenLog() }
+        fetchAll(triggerNotify: false); reschedule(); startBlogTimer(); checkForUpdates()
     }
 
-    // Poll both sources: notifications inbox + (optionally) newly-opened issues.
+    // Poll every source: notifications inbox + (optionally) new issues + blog posts.
     func fetchAll(triggerNotify: Bool) {
         refresh(triggerNotify: triggerNotify)
         if watchNewIssues { refreshIssues(triggerNotify: triggerNotify) }
+        if watchBlogs { refreshBlogs(triggerNotify: triggerNotify) }
+    }
+
+    // Blog feeds are slow-moving; poll on a fixed 4-hour cadence, separate from
+    // the user's notification interval.
+    func startBlogTimer() {
+        blogTimer?.invalidate(); blogTimer = nil
+        guard token != nil, watchBlogs else { return }
+        blogTimer = Timer.scheduledTimer(withTimeInterval: 14400, repeats: true) { [weak self] _ in
+            self?.refreshBlogs(triggerNotify: true)
+        }
     }
 
     // Load all repositories the token can access (paginated).
@@ -467,7 +601,130 @@ final class AppModel: ObservableObject {
         updateBadge()
     }
 
-    var badgeTotal: Int { unreadCount + newIssues.count }
+    // ---- blog-post watch (RSS/Atom feeds, deduped against a user-picked CSV) ----
+    func addBlogURL(_ raw: String) {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return }
+        if !s.lowercased().hasPrefix("http") { s = "https://" + s }
+        guard !blogURLs.contains(s) else { return }
+        blogURLs.append(s); persist()
+        if watchBlogs { refreshBlogs(triggerNotify: false) }
+    }
+    func removeBlogURL(_ u: String) {
+        blogURLs.removeAll { $0 == u }; blogSeeded.remove(u); persist()
+    }
+    func chooseSeenLog() {
+        let panel = NSSavePanel()
+        panel.title = "Choose or create the seen-log CSV"
+        panel.nameFieldStringValue = seenLogPath.isEmpty ? "gitpulse-seen.csv"
+            : (seenLogPath as NSString).lastPathComponent
+        if let csv = UTType(filenameExtension: "csv") { panel.allowedContentTypes = [csv] }
+        panel.isExtensionHidden = false
+        if panel.runModal() == .OK, let url = panel.url {
+            seenLogPath = url.path; persist(); loadSeenLog()
+        }
+    }
+
+    private func csvQuote(_ s: String) -> String {
+        let flat = s.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ")
+        return "\"" + flat.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+    private func firstCSVField(_ line: String) -> String {
+        guard let first = line.first else { return "" }
+        if first != "\"" { return String(line.prefix(while: { $0 != "," })) }
+        var out = ""; var i = line.index(after: line.startIndex)
+        while i < line.endIndex {
+            let c = line[i]
+            if c == "\"" {
+                let n = line.index(after: i)
+                if n < line.endIndex && line[n] == "\"" { out.append("\""); i = line.index(after: n); continue }
+                break
+            }
+            out.append(c); i = line.index(after: i)
+        }
+        return out
+    }
+    // Load the dedup keys (column 0) from the CSV into postSeen.
+    func loadSeenLog() {
+        guard !seenLogPath.isEmpty,
+              let content = try? String(contentsOfFile: seenLogPath, encoding: .utf8) else { return }
+        var loaded = Set<String>()
+        for (i, raw) in content.split(separator: "\n", omittingEmptySubsequences: true).enumerated() {
+            let line = String(raw)
+            if i == 0 && line.hasPrefix("key,") { continue }   // header
+            let key = firstCSVField(line)
+            if !key.isEmpty { loaded.insert(key) }
+        }
+        postSeen = loaded
+    }
+    private func appendSeenLog(_ rows: [(key: String, title: String, link: String)]) {
+        guard !seenLogPath.isEmpty, !rows.isEmpty else { return }
+        let url = URL(fileURLWithPath: seenLogPath)
+        let iso = ISO8601DateFormatter().string(from: Date())
+        let exists = FileManager.default.fileExists(atPath: seenLogPath)
+        var out = exists ? "" : "key,title,link,logged_at\n"
+        for r in rows { out += "\(csvQuote(r.key)),\(csvQuote(r.title)),\(csvQuote(r.link)),\(csvQuote(iso))\n" }
+        if exists, let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); if let d = out.data(using: .utf8) { h.write(d) }; try? h.close()
+        } else {
+            try? out.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+    private func hostOf(_ s: String) -> String { URL(string: s)?.host ?? s }
+
+    func refreshBlogs(triggerNotify: Bool) {
+        guard watchBlogs, !blogURLs.isEmpty else { return }
+        if seenLogPath.isEmpty {
+            DispatchQueue.main.async { self.status = "Blog watch needs a seen-log CSV chosen in Settings" }
+            return
+        }
+        let urls = blogURLs
+        let group = DispatchGroup()
+        var results: [(url: String, entries: [FeedEntry])] = []
+        let lock = NSLock()
+        for u in urls {
+            group.enter()
+            Feeds.discoverAndFetch(u) { entries in
+                lock.lock(); results.append((u, entries)); lock.unlock(); group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            var toShow: [Notif] = []
+            var toLog: [(key: String, title: String, link: String)] = []
+            for r in results {
+                let firstTime = !self.blogSeeded.contains(r.url)
+                for e in r.entries {
+                    if self.postSeen.contains(e.key) { continue }
+                    self.postSeen.insert(e.key)
+                    toLog.append((e.key, e.title, e.link))
+                    if firstTime { continue }   // silent seed: log but don't surface backlog
+                    toShow.append(Notif(id: "post-\(e.key)", repo: self.hostOf(e.link), type: "Post",
+                                        reason: "new post", title: e.title, updated: "",
+                                        commentURL: "", subjectURL: "", unread: true,
+                                        htmlURL: e.link, isPost: true))
+                }
+                if firstTime { self.blogSeeded.insert(r.url) }
+            }
+            self.persist()
+            self.appendSeenLog(toLog)
+            self.capSets()
+            guard !toShow.isEmpty else { return }
+            let existing = Set(self.newPosts.map { $0.id })
+            let add = toShow.filter { !existing.contains($0.id) }
+            self.newPosts.insert(contentsOf: add, at: 0)
+            if self.newPosts.count > 100 { self.newPosts = Array(self.newPosts.prefix(100)) }
+            self.updateBadge()
+            if triggerNotify && self.notify { for n in add { self.postNotification(for: n) } }
+        }
+    }
+
+    func openPost(_ id: Notif.ID) {
+        guard let n = newPosts.first(where: { $0.id == id }), let u = URL(string: n.htmlURL) else { return }
+        NSWorkspace.shared.open(u)
+    }
+    func dismissPost(_ id: Notif.ID) { newPosts.removeAll { $0.id == id }; updateBadge() }
+
+    var badgeTotal: Int { unreadCount + newIssues.count + newPosts.count }
     func updateBadge() {
         NSApp.dockTile.badgeLabel = badgeTotal > 0 ? "\(badgeTotal)" : ""
     }
@@ -476,7 +733,7 @@ final class AppModel: ObservableObject {
     func postNotification(for n: Notif) {
         resolveURL(n) { url in
             let c = UNMutableNotificationContent()
-            c.title = "GitHub: \(n.reason) · \(n.repo)"
+            c.title = n.isPost ? "New post · \(n.repo)" : "GitHub: \(n.reason) · \(n.repo)"
             c.body = n.title
             c.sound = .default
             c.userInfo = ["url": url]
@@ -681,6 +938,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var repoSearch = ""
     @State private var issueRepoSearch = ""
+    @State private var newBlogURL = ""
     let cols = [GridItem(.adaptive(minimum: 180), spacing: 8)]
     var filteredRepos: [String] {
         repoSearch.isEmpty ? model.allRepos
@@ -691,6 +949,7 @@ struct SettingsView: View {
             : model.allRepos.filter { $0.localizedCaseInsensitiveContains(issueRepoSearch) }
     }
     var body: some View {
+      ScrollView {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Settings").font(.title3.bold())
@@ -791,6 +1050,46 @@ struct SettingsView: View {
             }
 
             Divider()
+            Toggle("Watch blogs for new posts", isOn: $model.watchBlogs).toggleStyle(.switch)
+            Text("Checks each URL's RSS/Atom feed every 4 hours. New posts show in the panel with a “New Post” chip. Already-shown posts are recorded in a CSV you pick, so they never repeat.")
+                .font(.caption2).foregroundStyle(.tertiary)
+
+            if model.watchBlogs {
+                HStack {
+                    Button("Choose seen-log CSV…") { model.chooseSeenLog() }
+                    Spacer()
+                    Text(model.seenLogPath.isEmpty ? "no file chosen" : (model.seenLogPath as NSString).lastPathComponent)
+                        .font(.caption).foregroundStyle(model.seenLogPath.isEmpty ? .red : .secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                HStack {
+                    TextField("https://example.com/blog", text: $newBlogURL).textFieldStyle(.roundedBorder)
+                        .onSubmit { model.addBlogURL(newBlogURL); newBlogURL = "" }
+                    Button("Add") { model.addBlogURL(newBlogURL); newBlogURL = "" }
+                        .disabled(newBlogURL.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                if !model.blogURLs.isEmpty {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 1) {
+                            ForEach(model.blogURLs, id: \.self) { u in
+                                HStack {
+                                    Text(u).font(.caption).lineLimit(1).truncationMode(.middle)
+                                    Spacer()
+                                    Button { model.removeBlogURL(u) } label: { Image(systemName: "xmark.circle") }
+                                        .buttonStyle(.borderless).help("Remove")
+                                }.padding(.horizontal, 4)
+                            }
+                        }.padding(6)
+                    }
+                    .frame(height: 90)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.textBackgroundColor)))
+                } else {
+                    Text("Add blog URLs above — homepages or feed links both work.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+
+            Divider()
             Toggle("Require Touch ID to open GitPulse", isOn: $model.requireTouchID).toggleStyle(.switch)
             Text("Locks the app at launch; unlock with Touch ID (or your Mac password).")
                 .font(.caption2).foregroundStyle(.tertiary)
@@ -814,7 +1113,9 @@ struct SettingsView: View {
                 Text(model.login.isEmpty ? "" : "@\(model.login)").font(.caption).foregroundStyle(.secondary)
             }
         }
-        .padding(16).frame(width: 470, height: model.watchNewIssues ? 900 : 680)
+        .padding(16)
+      }
+      .frame(width: 470, height: min(640 + (model.watchNewIssues ? 220 : 0) + (model.watchBlogs ? 250 : 0), 940))
     }
 }
 
@@ -891,13 +1192,14 @@ struct PanelView: View {
                     .help("Quit GitPulse").keyboardShortcut("q")
             }.font(.callout)
 
-            if model.rows.isEmpty && model.newIssues.isEmpty {
+            if model.rows.isEmpty && model.newIssues.isEmpty && model.newPosts.isEmpty {
                 Text(model.loading ? "Loading…" : "Nothing matching your filters.")
                     .font(.callout).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 120)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
+                        ForEach(model.newPosts) { r in postRow(r); Divider() }
                         ForEach(model.newIssues) { r in issueRow(r); Divider() }
                         ForEach(model.rows) { r in row(r); Divider() }
                     }
@@ -932,6 +1234,31 @@ struct PanelView: View {
         .contextMenu {
             Button("Open on GitHub") { model.open(r.id) }
             Button("Mark as read") { model.markThreadRead(r.id) }
+        }
+    }
+
+    func postRow(_ r: Notif) -> some View {
+        HStack(spacing: 8) {
+            Text("New Post").font(.caption2.bold())
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Color.orange.opacity(0.22)).foregroundStyle(.orange).clipShape(Capsule())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(r.title).font(.callout).lineLimit(2)
+                Text(r.repo).font(.caption2).foregroundStyle(.secondary).lineLimit(1)   // repo holds the host
+            }
+            Spacer(minLength: 4)
+            Button { model.dismissPost(r.id) } label: { Image(systemName: "checkmark.circle") }
+                .buttonStyle(.borderless).help("Dismiss")
+            Button { model.openPost(r.id) } label: { Image(systemName: "arrow.up.right.square") }
+                .buttonStyle(.borderless).help("Open post")
+        }
+        .padding(.vertical, 6).padding(.horizontal, 6)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { model.openPost(r.id) }
+        .simultaneousGesture(TapGesture().modifiers(.command).onEnded { model.openPost(r.id) })
+        .contextMenu {
+            Button("Open post") { model.openPost(r.id) }
+            Button("Dismiss") { model.dismissPost(r.id) }
         }
     }
 
