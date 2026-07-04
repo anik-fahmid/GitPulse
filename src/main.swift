@@ -854,6 +854,7 @@ struct PanelView: View {
             else if model.locked { LockView() }
             else { main }
         }
+        .background(Color(NSColor.windowBackgroundColor))
     }
 
     var main: some View {
