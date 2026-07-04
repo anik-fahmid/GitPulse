@@ -95,6 +95,10 @@ struct GitHub {
 struct Notif: Identifiable {
     let id: String, repo: String, type: String, reason: String
     let title: String, updated: String, commentURL: String, subjectURL: String, unread: Bool
+    // Set for synthetic "new issue opened" rows (from the /repos/.../issues poll,
+    // not the notifications inbox). htmlURL lets us open without an extra API call.
+    var htmlURL: String = ""
+    var isIssue: Bool = false
 }
 
 let REASONS: [(value: String, label: String)] = [
@@ -119,6 +123,12 @@ struct Config: Codable {
     var notify = false; var intervalSeconds = 1800
     var selectedRepos: [String] = []
     var requireTouchID = false
+    // "Alert on every new issue opened" — independent of notification reasons.
+    // Scoped to selectedRepos. issueSince limits each poll's payload.
+    var watchNewIssues = false
+    var issueSince = ""
+    // Repos watched for new-issue alerts — independent of selectedRepos.
+    var issueRepos: [String] = []
 }
 func configURL() -> URL {
     let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gh-notif-reviewer")
@@ -152,9 +162,16 @@ final class AppModel: ObservableObject {
     @Published var updateMessage = ""
     @Published var requireTouchID: Bool { didSet { persist() } }
     @Published var locked = false
+    @Published var watchNewIssues: Bool { didSet { persist(); if watchNewIssues { refreshIssues(triggerNotify: false) } } }
+    @Published var issueRepos: Set<String> { didSet { persist(); issueSeeded = false; if watchNewIssues { refreshIssues(triggerNotify: false) } } }
+    // Synthetic rows for newly-opened issues (separate from the notifications inbox).
+    @Published var newIssues: [Notif] = []
+    var issueSince: String
 
     private var seen = Set<String>()
     private var seeded = false
+    private var issueSeen = Set<String>()
+    private var issueSeeded = false
     private var timer: Timer?
     // Locally marked-read items — suppressed even if the API still returns them briefly.
     private var readKeys = Set<String>()
@@ -164,6 +181,7 @@ final class AppModel: ObservableObject {
     private func capSets() {
         if seen.count > 1000 { seen = Set(seen.suffix(1000)) }
         if readKeys.count > 1000 { readKeys = Set(readKeys.suffix(1000)) }
+        if issueSeen.count > 1000 { issueSeen = Set(issueSeen.suffix(1000)) }
     }
 
     private init() {
@@ -172,9 +190,12 @@ final class AppModel: ObservableObject {
         notify = c.notify; intervalSeconds = c.intervalSeconds
         selectedRepos = Set(c.selectedRepos)
         requireTouchID = c.requireTouchID
+        watchNewIssues = c.watchNewIssues
+        issueSince = c.issueSince
+        issueRepos = Set(c.issueRepos)
     }
 
-    func persist() { saveConfig(Config(repos: repos, reasons: Array(reasons), unreadOnly: unreadOnly, notify: notify, intervalSeconds: intervalSeconds, selectedRepos: Array(selectedRepos), requireTouchID: requireTouchID)) }
+    func persist() { saveConfig(Config(repos: repos, reasons: Array(reasons), unreadOnly: unreadOnly, notify: notify, intervalSeconds: intervalSeconds, selectedRepos: Array(selectedRepos), requireTouchID: requireTouchID, watchNewIssues: watchNewIssues, issueSince: issueSince, issueRepos: Array(issueRepos))) }
 
     // ---- Touch ID lock ----
     func authenticate() {
@@ -193,7 +214,13 @@ final class AppModel: ObservableObject {
         }
     }
     private func startCore() {
-        fetchUser(); refresh(triggerNotify: false); reschedule(); checkForUpdates()
+        fetchUser(); fetchAll(triggerNotify: false); reschedule(); checkForUpdates()
+    }
+
+    // Poll both sources: notifications inbox + (optionally) newly-opened issues.
+    func fetchAll(triggerNotify: Bool) {
+        refresh(triggerNotify: triggerNotify)
+        if watchNewIssues { refreshIssues(triggerNotify: triggerNotify) }
     }
 
     // Load all repositories the token can access (paginated).
@@ -313,7 +340,7 @@ final class AppModel: ObservableObject {
         guard token != nil else { return }
         let secs = max(60, intervalSeconds)   // GitHub poll-interval floor is ~60s
         timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(secs), repeats: true) { [weak self] _ in
-            self?.refresh(triggerNotify: true)
+            self?.fetchAll(triggerNotify: true)
         }
     }
 
@@ -371,8 +398,78 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // ---- new-issue watch (separate data source from /notifications) ----
+    // The notifications inbox only surfaces threads you're subscribed to, so it can
+    // never show "every issue opened". This polls each selected repo's issue list.
+    func refreshIssues(triggerNotify: Bool) {
+        guard let token = token, watchNewIssues else { return }
+        let repos = Array(issueRepos)
+        guard !repos.isEmpty else {
+            DispatchQueue.main.async { self.status = "New-issue watch needs repositories selected in Settings" }
+            return
+        }
+        let sinceParam = issueSince.isEmpty ? "" : "&since=\(issueSince)"
+        let nowISO = ISO8601DateFormatter().string(from: Date())
+        let group = DispatchGroup()
+        var found: [Notif] = []
+        let lock = NSLock()
+        for repo in repos {
+            group.enter()
+            // sort/direction=created desc; since caps payload. PRs are filtered below.
+            GitHub.req("https://api.github.com/repos/\(repo)/issues?state=open&sort=created&direction=desc&per_page=20\(sinceParam)", token: token) { d, code in
+                defer { group.leave() }
+                guard code == 200, let d = d,
+                      let arr = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else { return }
+                var local: [Notif] = []
+                for it in arr {
+                    if it["pull_request"] != nil { continue }   // issues endpoint also returns PRs
+                    let gid = "issue-\(it["id"] as? Int ?? 0)"
+                    let title = it["title"] as? String ?? ""
+                    let html = it["html_url"] as? String ?? "https://github.com/\(repo)"
+                    let created = (it["created_at"] as? String ?? "")
+                        .replacingOccurrences(of: "T", with: " ").replacingOccurrences(of: "Z", with: "")
+                    local.append(Notif(id: gid, repo: repo, type: "Issue", reason: "issue opened",
+                                       title: title, updated: created, commentURL: "", subjectURL: "",
+                                       unread: true, htmlURL: html, isIssue: true))
+                }
+                lock.lock(); found.append(contentsOf: local); lock.unlock()
+            }
+        }
+        group.notify(queue: .main) {
+            self.issueSince = nowISO; self.persist()
+            // First pass seeds the "seen" set silently so we don't alert on the backlog.
+            if !self.issueSeeded {
+                for n in found { self.issueSeen.insert(n.id) }
+                self.issueSeeded = true; self.capSets(); return
+            }
+            let fresh = found.filter { !self.issueSeen.contains($0.id) }
+            for n in fresh { self.issueSeen.insert(n.id) }
+            self.capSets()
+            let existing = Set(self.newIssues.map { $0.id })
+            let add = fresh.filter { !existing.contains($0.id) }
+            guard !add.isEmpty else { return }
+            self.newIssues.insert(contentsOf: add, at: 0)
+            if self.newIssues.count > 100 { self.newIssues = Array(self.newIssues.prefix(100)) }
+            self.updateBadge()
+            if triggerNotify && self.notify {
+                for n in add { self.postNotification(for: n) }
+            }
+        }
+    }
+
+    func openIssue(_ id: Notif.ID) {
+        guard let n = newIssues.first(where: { $0.id == id }), let u = URL(string: n.htmlURL) else { return }
+        NSWorkspace.shared.open(u)
+    }
+    // "Dismiss" = remove locally; issueSeen already holds the id so it won't return.
+    func dismissIssue(_ id: Notif.ID) {
+        newIssues.removeAll { $0.id == id }
+        updateBadge()
+    }
+
+    var badgeTotal: Int { unreadCount + newIssues.count }
     func updateBadge() {
-        NSApp.dockTile.badgeLabel = unreadCount > 0 ? "\(unreadCount)" : ""
+        NSApp.dockTile.badgeLabel = badgeTotal > 0 ? "\(badgeTotal)" : ""
     }
 
     // ---- desktop notifications ----
@@ -424,6 +521,7 @@ final class AppModel: ObservableObject {
     }
 
     func resolveURL(_ n: Notif, completion: @escaping (String) -> Void) {
+        if !n.htmlURL.isEmpty { completion(n.htmlURL); return }
         let api = n.commentURL.isEmpty ? n.subjectURL : n.commentURL
         let fallback = "https://github.com/\(n.repo)"
         guard !api.isEmpty, let token = token else { completion(fallback); return }
@@ -582,10 +680,15 @@ struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var repoSearch = ""
+    @State private var issueRepoSearch = ""
     let cols = [GridItem(.adaptive(minimum: 180), spacing: 8)]
     var filteredRepos: [String] {
         repoSearch.isEmpty ? model.allRepos
             : model.allRepos.filter { $0.localizedCaseInsensitiveContains(repoSearch) }
+    }
+    var filteredIssueRepos: [String] {
+        issueRepoSearch.isEmpty ? model.allRepos
+            : model.allRepos.filter { $0.localizedCaseInsensitiveContains(issueRepoSearch) }
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -649,6 +752,45 @@ struct SettingsView: View {
             }
 
             Divider()
+            Toggle("Alert on every new issue opened", isOn: $model.watchNewIssues).toggleStyle(.switch)
+            Text("Independent of the notification types and repositories above. Pick the repositories to watch below — alerts fire when any new issue opens, even ones you're not subscribed to.")
+                .font(.caption2).foregroundStyle(.tertiary)
+
+            if model.watchNewIssues {
+                HStack {
+                    Text("Issue repos — \(model.issueRepos.isEmpty ? "none" : "\(model.issueRepos.count) selected")")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if model.allRepos.isEmpty {
+                        Button(model.loadingRepos ? "Loading…" : "Load repos") { model.fetchRepos() }.disabled(model.loadingRepos)
+                    }
+                }
+                if model.allRepos.isEmpty {
+                    Text("Click “Load repos” to list repositories, then check the ones to watch for new issues.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                } else {
+                    TextField("Search repositories…", text: $issueRepoSearch).textFieldStyle(.roundedBorder)
+                    HStack(spacing: 10) {
+                        Button("Clear") { model.issueRepos.removeAll() }
+                        Spacer()
+                        Text("\(filteredIssueRepos.count) shown").foregroundStyle(.secondary)
+                    }.font(.caption)
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 1) {
+                            ForEach(filteredIssueRepos, id: \.self) { repo in
+                                Toggle(isOn: Binding(
+                                    get: { model.issueRepos.contains(repo) },
+                                    set: { on in if on { model.issueRepos.insert(repo) } else { model.issueRepos.remove(repo) } }
+                                )) { Text(repo).font(.callout) }.toggleStyle(.checkbox)
+                            }
+                        }.padding(6)
+                    }
+                    .frame(height: 110)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.textBackgroundColor)))
+                }
+            }
+
+            Divider()
             Toggle("Require Touch ID to open GitPulse", isOn: $model.requireTouchID).toggleStyle(.switch)
             Text("Locks the app at launch; unlock with Touch ID (or your Mac password).")
                 .font(.caption2).foregroundStyle(.tertiary)
@@ -672,7 +814,7 @@ struct SettingsView: View {
                 Text(model.login.isEmpty ? "" : "@\(model.login)").font(.caption).foregroundStyle(.secondary)
             }
         }
-        .padding(16).frame(width: 470, height: 680)
+        .padding(16).frame(width: 470, height: model.watchNewIssues ? 900 : 680)
     }
 }
 
@@ -723,9 +865,9 @@ struct PanelView: View {
                     if !model.login.isEmpty { Text("@\(model.login)").font(.caption2).foregroundStyle(.secondary) }
                 }
                 Spacer()
-                Text("\(model.unreadCount)").font(.headline)
+                Text("\(model.badgeTotal)").font(.headline)
                     .padding(.horizontal, 8).padding(.vertical, 2)
-                    .background(model.unreadCount > 0 ? Color.red.opacity(0.18) : Color.gray.opacity(0.15))
+                    .background(model.badgeTotal > 0 ? Color.red.opacity(0.18) : Color.gray.opacity(0.15))
                     .clipShape(Capsule())
                 Button { openSettings() } label: { Image(systemName: "gearshape") }
                     .buttonStyle(.borderless).help("Settings")
@@ -740,7 +882,7 @@ struct PanelView: View {
             }
 
             HStack(spacing: 8) {
-                Button { model.refresh(triggerNotify: false) } label: { Label("Fetch", systemImage: "arrow.clockwise") }
+                Button { model.fetchAll(triggerNotify: false) } label: { Label("Fetch", systemImage: "arrow.clockwise") }
                 Button("Mark all read") { model.markAllRead() }
                 if model.loading { ProgressView().controlSize(.small) }
                 Spacer()
@@ -748,13 +890,14 @@ struct PanelView: View {
                     .help("Quit GitPulse").keyboardShortcut("q")
             }.font(.callout)
 
-            if model.rows.isEmpty {
+            if model.rows.isEmpty && model.newIssues.isEmpty {
                 Text(model.loading ? "Loading…" : "Nothing matching your filters.")
                     .font(.callout).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 120)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
+                        ForEach(model.newIssues) { r in issueRow(r); Divider() }
                         ForEach(model.rows) { r in row(r); Divider() }
                     }
                 }
@@ -788,6 +931,29 @@ struct PanelView: View {
         .contextMenu {
             Button("Open on GitHub") { model.open(r.id) }
             Button("Mark as read") { model.markThreadRead(r.id) }
+        }
+    }
+
+    func issueRow(_ r: Notif) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "smallcircle.filled.circle").foregroundStyle(.green).font(.caption)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(r.title).font(.callout).lineLimit(2)
+                Text("\(r.repo) · new issue").font(.caption2).foregroundStyle(.green).lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Button { model.dismissIssue(r.id) } label: { Image(systemName: "checkmark.circle") }
+                .buttonStyle(.borderless).help("Dismiss")
+            Button { model.openIssue(r.id) } label: { Image(systemName: "arrow.up.right.square") }
+                .buttonStyle(.borderless).help("Open on GitHub")
+        }
+        .padding(.vertical, 6).padding(.horizontal, 6)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { model.openIssue(r.id) }
+        .simultaneousGesture(TapGesture().modifiers(.command).onEnded { model.openIssue(r.id) })
+        .contextMenu {
+            Button("Open on GitHub") { model.openIssue(r.id) }
+            Button("Dismiss") { model.dismissIssue(r.id) }
         }
     }
 }
@@ -832,8 +998,8 @@ struct GitPulseApp: App {
         MenuBarExtra {
             PanelView().environmentObject(model)
         } label: {
-            if model.unreadCount > 0 {
-                Label("\(model.unreadCount)", systemImage: "bell.badge.fill")
+            if model.badgeTotal > 0 {
+                Label("\(model.badgeTotal)", systemImage: "bell.badge.fill")
             } else {
                 Image(systemName: "bell")
             }
