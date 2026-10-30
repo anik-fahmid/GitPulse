@@ -201,6 +201,7 @@ struct Notif: Identifiable {
     var htmlURL: String = ""
     var isIssue: Bool = false
     var isPost: Bool = false   // synthetic "new blog post" rows
+    var isFB: Bool = false     // synthetic Facebook group rows; type = "FB Post" / "FB Comment"
 }
 
 let REASONS: [(value: String, label: String)] = [
@@ -236,6 +237,36 @@ struct Config: Codable {
     var blogURLs: [String] = []
     var seenLogPath = ""
     var blogSeeded: [String] = []
+    // Facebook group watch: reads a JSON event file written by an external scraper.
+    var watchFB = false
+    var fbFeedPath = ""
+    var fbSeeded = false
+}
+// Decode key by key so a config written by an older build (missing newer keys)
+// keeps its values instead of failing and silently resetting to defaults.
+extension Config {
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        var x = Config()
+        x.repos = try c.decodeIfPresent(String.self, forKey: .repos) ?? x.repos
+        x.reasons = try c.decodeIfPresent([String].self, forKey: .reasons) ?? x.reasons
+        x.unreadOnly = try c.decodeIfPresent(Bool.self, forKey: .unreadOnly) ?? x.unreadOnly
+        x.notify = try c.decodeIfPresent(Bool.self, forKey: .notify) ?? x.notify
+        x.intervalSeconds = try c.decodeIfPresent(Int.self, forKey: .intervalSeconds) ?? x.intervalSeconds
+        x.selectedRepos = try c.decodeIfPresent([String].self, forKey: .selectedRepos) ?? x.selectedRepos
+        x.requireTouchID = try c.decodeIfPresent(Bool.self, forKey: .requireTouchID) ?? x.requireTouchID
+        x.watchNewIssues = try c.decodeIfPresent(Bool.self, forKey: .watchNewIssues) ?? x.watchNewIssues
+        x.issueSince = try c.decodeIfPresent(String.self, forKey: .issueSince) ?? x.issueSince
+        x.issueRepos = try c.decodeIfPresent([String].self, forKey: .issueRepos) ?? x.issueRepos
+        x.watchBlogs = try c.decodeIfPresent(Bool.self, forKey: .watchBlogs) ?? x.watchBlogs
+        x.blogURLs = try c.decodeIfPresent([String].self, forKey: .blogURLs) ?? x.blogURLs
+        x.seenLogPath = try c.decodeIfPresent(String.self, forKey: .seenLogPath) ?? x.seenLogPath
+        x.blogSeeded = try c.decodeIfPresent([String].self, forKey: .blogSeeded) ?? x.blogSeeded
+        x.watchFB = try c.decodeIfPresent(Bool.self, forKey: .watchFB) ?? x.watchFB
+        x.fbFeedPath = try c.decodeIfPresent(String.self, forKey: .fbFeedPath) ?? x.fbFeedPath
+        x.fbSeeded = try c.decodeIfPresent(Bool.self, forKey: .fbSeeded) ?? x.fbSeeded
+        self = x
+    }
 }
 func configURL() -> URL {
     let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gh-notif-reviewer")
@@ -284,6 +315,12 @@ final class AppModel: ObservableObject {
     private var postSeen = Set<String>()
     private var blogTimer: Timer?
 
+    // Facebook group watch.
+    @Published var watchFB: Bool { didSet { persist(); if watchFB { loadSeenLog(); refreshFB(triggerNotify: false) } } }
+    @Published var fbFeedPath: String
+    @Published var fbItems: [Notif] = []
+    private var fbSeeded: Bool
+
     private var seen = Set<String>()
     private var seeded = false
     private var issueSeen = Set<String>()
@@ -314,9 +351,12 @@ final class AppModel: ObservableObject {
         blogURLs = c.blogURLs
         seenLogPath = c.seenLogPath
         blogSeeded = Set(c.blogSeeded)
+        watchFB = c.watchFB
+        fbFeedPath = c.fbFeedPath
+        fbSeeded = c.fbSeeded
     }
 
-    func persist() { saveConfig(Config(repos: repos, reasons: Array(reasons), unreadOnly: unreadOnly, notify: notify, intervalSeconds: intervalSeconds, selectedRepos: Array(selectedRepos), requireTouchID: requireTouchID, watchNewIssues: watchNewIssues, issueSince: issueSince, issueRepos: Array(issueRepos), watchBlogs: watchBlogs, blogURLs: blogURLs, seenLogPath: seenLogPath, blogSeeded: Array(blogSeeded))) }
+    func persist() { saveConfig(Config(repos: repos, reasons: Array(reasons), unreadOnly: unreadOnly, notify: notify, intervalSeconds: intervalSeconds, selectedRepos: Array(selectedRepos), requireTouchID: requireTouchID, watchNewIssues: watchNewIssues, issueSince: issueSince, issueRepos: Array(issueRepos), watchBlogs: watchBlogs, blogURLs: blogURLs, seenLogPath: seenLogPath, blogSeeded: Array(blogSeeded), watchFB: watchFB, fbFeedPath: fbFeedPath, fbSeeded: fbSeeded)) }
 
     // ---- Touch ID lock ----
     func authenticate() {
@@ -336,7 +376,7 @@ final class AppModel: ObservableObject {
     }
     private func startCore() {
         fetchUser()
-        if watchBlogs { loadSeenLog() }
+        if watchBlogs || watchFB { loadSeenLog() }
         fetchAll(triggerNotify: false); reschedule(); startBlogTimer(); checkForUpdates()
     }
 
@@ -345,6 +385,7 @@ final class AppModel: ObservableObject {
         refresh(triggerNotify: triggerNotify)
         if watchNewIssues { refreshIssues(triggerNotify: triggerNotify) }
         if watchBlogs { refreshBlogs(triggerNotify: triggerNotify) }
+        if watchFB { refreshFB(triggerNotify: triggerNotify) }
     }
 
     // Blog feeds are slow-moving; poll on a fixed 4-hour cadence, separate from
@@ -724,7 +765,77 @@ final class AppModel: ObservableObject {
     }
     func dismissPost(_ id: Notif.ID) { newPosts.removeAll { $0.id == id }; updateBadge() }
 
-    var badgeTotal: Int { unreadCount + newIssues.count + newPosts.count }
+    // ---- Facebook group watch (reads the JSON event file an external scraper writes) ----
+    // File shape: {"updated": ISO8601, "group": "...", "events": [{"key", "kind": "post"|"comment",
+    // "title", "author", "link", "count"}]}. Keys go through the same seen-log CSV as blog posts.
+    func chooseFBFeed() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose the Facebook group feed file"
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        if let json = UTType(filenameExtension: "json") { panel.allowedContentTypes = [json] }
+        if panel.runModal() == .OK, let url = panel.url {
+            fbFeedPath = url.path; fbSeeded = false; persist()
+            if watchFB { refreshFB(triggerNotify: false) }
+        }
+    }
+
+    func refreshFB(triggerNotify: Bool) {
+        guard watchFB else { return }
+        if fbFeedPath.isEmpty { status = "Facebook watch needs a feed file chosen in Settings"; return }
+        if seenLogPath.isEmpty { status = "Facebook watch needs a seen-log CSV chosen in Settings"; return }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: fbFeedPath)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = obj["events"] as? [[String: Any]] else {
+            status = "Facebook feed file is missing or unreadable"; return
+        }
+        if let up = obj["updated"] as? String, let d = ISO8601DateFormatter().date(from: up),
+           Date().timeIntervalSince(d) > 6 * 3600 {
+            let f = RelativeDateTimeFormatter(); f.unitsStyle = .full
+            status = "Facebook feed last updated \(f.localizedString(for: d, relativeTo: Date()))"
+        }
+        let group = obj["group"] as? String ?? "Facebook group"
+        let firstTime = !fbSeeded
+        var toShow: [Notif] = []
+        var toLog: [(key: String, title: String, link: String)] = []
+        for e in events {
+            guard let k = e["key"] as? String, !k.isEmpty else { continue }
+            let key = "fb:" + k
+            if postSeen.contains(key) { continue }
+            postSeen.insert(key)
+            let link = e["link"] as? String ?? ""
+            let isComment = (e["kind"] as? String) == "comment"
+            let author = e["author"] as? String ?? ""
+            var title = e["title"] as? String ?? ""
+            if title.isEmpty { title = isComment ? "New comment" : "New post" }
+            if isComment, let n = e["count"] as? Int, n > 0 {
+                title = "\(n) new comment\(n == 1 ? "" : "s") on: \(title)"
+            }
+            toLog.append((key, title, link))
+            if firstTime { continue }   // silent seed: log but don't surface backlog
+            toShow.append(Notif(id: key, repo: author.isEmpty ? group : "\(group) · \(author)",
+                                type: isComment ? "FB Comment" : "FB Post", reason: "facebook",
+                                title: title, updated: "", commentURL: "", subjectURL: "", unread: true,
+                                htmlURL: link, isFB: true))
+        }
+        if firstTime { fbSeeded = true; persist() }
+        appendSeenLog(toLog)
+        capSets()
+        guard !toShow.isEmpty else { return }
+        let existing = Set(fbItems.map { $0.id })
+        let add = toShow.filter { !existing.contains($0.id) }
+        fbItems.insert(contentsOf: add, at: 0)
+        if fbItems.count > 100 { fbItems = Array(fbItems.prefix(100)) }
+        updateBadge()
+        if triggerNotify && notify { for n in add { postNotification(for: n) } }
+    }
+
+    func openFB(_ id: Notif.ID) {
+        guard let n = fbItems.first(where: { $0.id == id }), let u = URL(string: n.htmlURL) else { return }
+        NSWorkspace.shared.open(u)
+    }
+    func dismissFB(_ id: Notif.ID) { fbItems.removeAll { $0.id == id }; updateBadge() }
+
+    var badgeTotal: Int { unreadCount + newIssues.count + newPosts.count + fbItems.count }
     func updateBadge() {
         NSApp.dockTile.badgeLabel = badgeTotal > 0 ? "\(badgeTotal)" : ""
     }
@@ -733,7 +844,8 @@ final class AppModel: ObservableObject {
     func postNotification(for n: Notif) {
         resolveURL(n) { url in
             let c = UNMutableNotificationContent()
-            c.title = n.isPost ? "New post · \(n.repo)" : "GitHub: \(n.reason) · \(n.repo)"
+            c.title = n.isFB ? "\(n.type) · \(n.repo)"
+                : n.isPost ? "New post · \(n.repo)" : "GitHub: \(n.reason) · \(n.repo)"
             c.body = n.title
             c.sound = .default
             c.userInfo = ["url": url]
@@ -1090,6 +1202,27 @@ struct SettingsView: View {
             }
 
             Divider()
+            Toggle("Watch a Facebook group", isOn: $model.watchFB).toggleStyle(.switch)
+            Text("Reads the feed file a separate scraper writes. New posts show with an “FB Post” chip, new comments on older posts with an “FB Comment” chip. Uses the same seen-log CSV as blog watch.")
+                .font(.caption2).foregroundStyle(.tertiary)
+            if model.watchFB {
+                HStack {
+                    Button("Choose feed file…") { model.chooseFBFeed() }
+                    Spacer()
+                    Text(model.fbFeedPath.isEmpty ? "no file chosen" : (model.fbFeedPath as NSString).lastPathComponent)
+                        .font(.caption).foregroundStyle(model.fbFeedPath.isEmpty ? .red : .secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                HStack {
+                    Button("Choose seen-log CSV…") { model.chooseSeenLog() }
+                    Spacer()
+                    Text(model.seenLogPath.isEmpty ? "no file chosen" : (model.seenLogPath as NSString).lastPathComponent)
+                        .font(.caption).foregroundStyle(model.seenLogPath.isEmpty ? .red : .secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+            }
+
+            Divider()
             Toggle("Require Touch ID to open GitPulse", isOn: $model.requireTouchID).toggleStyle(.switch)
             Text("Locks the app at launch; unlock with Touch ID (or your Mac password).")
                 .font(.caption2).foregroundStyle(.tertiary)
@@ -1115,7 +1248,7 @@ struct SettingsView: View {
         }
         .padding(16)
       }
-      .frame(width: 470, height: min(640 + (model.watchNewIssues ? 220 : 0) + (model.watchBlogs ? 250 : 0), 940))
+      .frame(width: 470, height: min(640 + (model.watchNewIssues ? 220 : 0) + (model.watchBlogs ? 250 : 0) + (model.watchFB ? 120 : 0), 980))
     }
 }
 
@@ -1192,13 +1325,14 @@ struct PanelView: View {
                     .help("Quit GitPulse").keyboardShortcut("q")
             }.font(.callout)
 
-            if model.rows.isEmpty && model.newIssues.isEmpty && model.newPosts.isEmpty {
+            if model.rows.isEmpty && model.newIssues.isEmpty && model.newPosts.isEmpty && model.fbItems.isEmpty {
                 Text(model.loading ? "Loading…" : "Nothing matching your filters.")
                     .font(.callout).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 120)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
+                        ForEach(model.fbItems) { r in fbRow(r); Divider() }
                         ForEach(model.newPosts) { r in postRow(r); Divider() }
                         ForEach(model.newIssues) { r in issueRow(r); Divider() }
                         ForEach(model.rows) { r in row(r); Divider() }
@@ -1259,6 +1393,32 @@ struct PanelView: View {
         .contextMenu {
             Button("Open post") { model.openPost(r.id) }
             Button("Dismiss") { model.dismissPost(r.id) }
+        }
+    }
+
+    func fbRow(_ r: Notif) -> some View {
+        let tint: Color = r.type == "FB Comment" ? .purple : .blue
+        return HStack(spacing: 8) {
+            Text(r.type).font(.caption2.bold())
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(tint.opacity(0.2)).foregroundStyle(tint).clipShape(Capsule())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(r.title).font(.callout).lineLimit(2)
+                Text(r.repo).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Button { model.dismissFB(r.id) } label: { Image(systemName: "checkmark.circle") }
+                .buttonStyle(.borderless).help("Dismiss")
+            Button { model.openFB(r.id) } label: { Image(systemName: "arrow.up.right.square") }
+                .buttonStyle(.borderless).help("Open on Facebook")
+        }
+        .padding(.vertical, 6).padding(.horizontal, 6)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { model.openFB(r.id) }
+        .simultaneousGesture(TapGesture().modifiers(.command).onEnded { model.openFB(r.id) })
+        .contextMenu {
+            Button("Open on Facebook") { model.openFB(r.id) }
+            Button("Dismiss") { model.dismissFB(r.id) }
         }
     }
 
