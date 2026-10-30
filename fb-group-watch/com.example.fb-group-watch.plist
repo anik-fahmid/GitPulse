@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Replace __NODE__ (output of `which node`) and __DIR__ (this folder), then:
+     cp com.example.fb-group-watch.plist ~/Library/LaunchAgents/
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.fb-group-watch.plist
+     Runs at 12:00, 16:00 and 20:00; a time missed while asleep runs once on wake. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.fb-group-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__DIR__/index.js</string>
+    <string>--jitter</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__DIR__</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>__DIR__/logs/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__DIR__/logs/launchd.log</string>
+</dict>
+</plist>

@@ -6,3 +6,11 @@ dmg-stage/
 icon_1024.png
 .DS_Store
 GitPulse.dmg
+
+# FB Group Watch runtime (live Facebook session, state, output)
+fb-group-watch/profile/
+fb-group-watch/state.json
+fb-group-watch/gitpulse-fb.json
+fb-group-watch/node_modules/
+fb-group-watch/logs/
+fb-group-watch/package-lock.json

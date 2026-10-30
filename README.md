@@ -38,6 +38,10 @@ GitHub's notification inbox is noisy. GitPulse lives in your menu bar, shows an 
 - **Mark all read** and **per-notification mark as read** — instant, no reappearing.
 - **⌘-click** or **double-click** a row to open it on GitHub.
 
+**Facebook group watch**
+- New posts and new comments in one Facebook group show in the panel with **FB Post** / **FB Comment** chips.
+- Fed by a small companion scanner, run separately on your Mac. Setup steps are in [`fb-group-watch/`](fb-group-watch/README.md).
+
 **Private & lightweight**
 - Built-in **Sign in with GitHub** (OAuth Device Flow) or a **Personal Access Token**.
 - Token is stored in the **encrypted macOS Keychain** (device-only) — never in the app bundle or a plaintext file.
